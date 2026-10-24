@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3.2';
+const APP_VERSION = '8.3.3';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -1533,76 +1533,75 @@ function appendValidatedCaps(out, loopSets, plane) {
 }
 
 
-function buildingBoundaryLoops(tris) {
-  const edgeMap=new Map();
+function boundaryLoopsForTriangles(tris) {
+  const edges=new Map();
   const add=(a,b)=>{
     const k=a<b?`${a}|${b}`:`${b}|${a}`;
-    const rec=edgeMap.get(k) || {a,b,count:0};
-    rec.count++;
-    edgeMap.set(k,rec);
+    const e=edges.get(k)||{a,b,count:0}; e.count++; edges.set(k,e);
   };
-  for(const [ia,ib,ic] of tris){ add(ia,ib); add(ib,ic); add(ic,ia); }
-  const boundary=[...edgeMap.values()].filter(e=>e.count===1);
-  if(!boundary.length) return [];
+  for(const [a,b,c] of tris){ add(a,b); add(b,c); add(c,a); }
+  const bnd=[...edges.values()].filter(e=>e.count===1);
+  if(!bnd.length) return [];
   const adj=new Map();
-  const addAdj=(u,v,ei)=>{
-    if(!adj.has(u)) adj.set(u,[]);
-    adj.get(u).push({v,ei});
-  };
-  boundary.forEach((e,ei)=>{ addAdj(e.a,e.b,ei); addAdj(e.b,e.a,ei); });
-  const used=new Set();
-  const loops=[];
-  for(let i=0;i<boundary.length;i++){
+  bnd.forEach((e,i)=>{
+    for(const [u,v] of [[e.a,e.b],[e.b,e.a]]){
+      if(!adj.has(u)) adj.set(u,[]);
+      adj.get(u).push({v,ei:i});
+    }
+  });
+  const used=new Set(), loops=[];
+  for(let i=0;i<bnd.length;i++){
     if(used.has(i)) continue;
-    const e0=boundary[i];
-    used.add(i);
-    const path=[e0.a,e0.b];
-    let start=e0.a, prev=e0.a, curr=e0.b, guard=0, closed=false;
+    const e0=bnd[i]; used.add(i);
+    const idx=[e0.a,e0.b];
+    const start=e0.a; let prev=e0.a,curr=e0.b,closed=false,guard=0;
     while(guard++<100000){
       const opts=(adj.get(curr)||[]).filter(o=>!used.has(o.ei) && o.v!==prev);
-      const next=opts.length?opts[0]:null;
-      if(!next) break;
-      used.add(next.ei);
-      prev=curr; curr=next.v;
-      if(curr===start){ closed=true; break; }
-      path.push(curr);
+      if(!opts.length) break;
+      const n=opts[0]; used.add(n.ei); prev=curr; curr=n.v;
+      if(curr===start){closed=true;break;}
+      idx.push(curr);
     }
-    loops.push({indices:path,closed});
+    loops.push({indices:idx,closed});
   }
   return loops;
 }
 
-function classifyBoundaryLoops(loopInfo, verts){
-  const loops=loopInfo.filter(L=>L.indices.length>=3).map(L=>{
-    const idx=L.indices;
-    const zs=idx.map(i=>verts[i].p[2]).filter(Number.isFinite);
-    const gaps=idx.map(i=>verts[i].p[2]-verts[i].terrainZ).filter(Number.isFinite);
-    const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:NaN;
-    return { ...L, zMean:mean(zs), zMin:Math.min(...zs), zMax:Math.max(...zs), gapMean:mean(gaps), gapMin:Math.min(...gaps), gapMax:Math.max(...gaps) };
-  });
-  if(!loops.length) return {loops, top:[], bottom:[]};
-  const zMin=Math.min(...loops.map(l=>l.zMin));
-  const zMax=Math.max(...loops.map(l=>l.zMax));
-  const range=Math.max(1e-6,zMax-zMin);
-  const top=loops.filter(l=>l.closed && l.zMean>=zMin+0.55*range && l.gapMean>0.45);
-  const bottom=loops.filter(l=>l.zMean<=zMin+0.35*range);
-  return {loops,top,bottom};
+function capClosedTopBoundaryLoops(tris, verts) {
+  const loops=boundaryLoopsForTriangles(tris).filter(l=>l.closed && l.indices.length>=3);
+  if(!loops.length) return {tris:[],count:0};
+  const allZ=loops.flatMap(l=>l.indices.map(i=>verts[i].p[2])).filter(Number.isFinite);
+  if(!allZ.length) return {tris:[],count:0};
+  const globalMin=Math.min(...allZ), globalMax=Math.max(...allZ), range=Math.max(1e-6,globalMax-globalMin);
+  const added=[];
+  for(const loop of loops){
+    const zs=loop.indices.map(i=>verts[i].p[2]);
+    const zMean=zs.reduce((a,b)=>a+b,0)/zs.length;
+    const gaps=loop.indices.map(i=>verts[i].p[2]-verts[i].terrainZ).filter(Number.isFinite);
+    const gapMean=gaps.length?gaps.reduce((a,b)=>a+b,0)/gaps.length:0;
+    if(zMean < globalMin + 0.52*range || gapMean < 0.35) continue;
+    const pts=loop.indices.map(i=>new THREE.Vector2(verts[i].p[0],verts[i].p[1]));
+    const cap=THREE.ShapeUtils.triangulateShape(pts,[]);
+    for(const tr of cap){
+      const ia=loop.indices[tr[0]],ib=loop.indices[tr[1]],ic=loop.indices[tr[2]];
+      const A=verts[ia].p,B=verts[ib].p,C=verts[ic].p;
+      const nz=(B[0]-A[0])*(C[1]-A[1])-(B[1]-A[1])*(C[0]-A[0]);
+      added.push(nz>=0?[ia,ib,ic]:[ia,ic,ib]);
+    }
+  }
+  return {tris:added,count:added.length};
 }
 
-function triangulateTopLoopIndices(loop, verts){
-  if(!loop.closed || loop.indices.length<3) return [];
-  const pts=loop.indices.map(i=>new THREE.Vector2(verts[i].p[0], verts[i].p[1]));
-  const tris=THREE.ShapeUtils.triangulateShape(pts,[]);
-  const out=[];
-  for(const tr of tris){
-    const ia=loop.indices[tr[0]], ib=loop.indices[tr[1]], ic=loop.indices[tr[2]];
-    const A=verts[ia].p, B=verts[ib].p, C=verts[ic].p;
-    const ux=B[0]-A[0], uy=B[1]-A[1], uz=B[2]-A[2];
-    const vx=C[0]-A[0], vy=C[1]-A[1], vz=C[2]-A[2];
-    const nz=ux*vy-uy*vx;
-    out.push(nz>=0 ? [ia,ib,ic] : [ia,ic,ib]);
-  }
-  return out;
+function ruinBottomBoundaryIndices(tris, verts) {
+  const loops=boundaryLoopsForTriangles(tris).filter(l=>l.indices.length>=2);
+  if(!loops.length) return [];
+  const desc=loops.map(l=>{
+    const gaps=l.indices.map(i=>verts[i].p[2]-verts[i].terrainZ).filter(Number.isFinite);
+    const zs=l.indices.map(i=>verts[i].p[2]).filter(Number.isFinite);
+    return {l, gap:gaps.length?percentile(gaps,0.35):Infinity, z:zs.length?percentile(zs,0.35):Infinity};
+  });
+  const zMin=Math.min(...desc.map(d=>d.z)),zMax=Math.max(...desc.map(d=>d.z)),range=Math.max(1e-6,zMax-zMin);
+  return [...new Set(desc.filter(d=>d.z<=zMin+0.40*range).flatMap(d=>d.l.indices))];
 }
 
 function triangleIndices(idx, ti){
@@ -2083,38 +2082,55 @@ async function loadBuildingTriangles(t) {
     for(const [r,tris0] of compTris){
       const vis=compVerts.get(r)||[];
       if(!vis.length) continue;
-
       let tris=tris0.slice();
-      let ruinTopCapsAdded=0;
-      const loopClass=classifyBoundaryLoops(buildingBoundaryLoops(tris), verts);
-      // Offen modellierte Ruinen-/Mauerobjekte: obere Rand-Schlaufen sauber deckeln.
-      for(const loop of loopClass.top){
-        const add=triangulateTopLoopIndices(loop, verts);
-        if(add.length){ tris.push(...add); ruinTopCapsAdded += add.length; }
+
+      // Ruinen / offene Mauerkoerper: erst die obere offene Randkontur deckeln.
+      const topCaps=capClosedTopBoundaryLoops(tris,verts);
+      if(topCaps.count){
+        tris.push(...topCaps.tris);
+        debug(`Ruinen-/Maueroberseite geschlossen: ${topCaps.count.toLocaleString('de-CH')} Dreiecke.`);
       }
-      if(ruinTopCapsAdded){
-        debug(`Ruinen-/Maueroberseiten geschlossen: ${ruinTopCapsAdded.toLocaleString('de-CH')} Dreiecke.`);
-      }
-      // Offene Ruinen schweben oft als ganzer Körper über dem Gelände. Verwende
-      // die unteren offenen Randschlaufen als robustere Fundamentreferenz und
-      // senke den ganzen Baukörper starr zusätzlich ab.
-      if(loopClass.bottom.length){
-        const bottomIdx=[...new Set(loopClass.bottom.flatMap(l=>l.indices))];
-        const bottomGaps=bottomIdx.map(i=>verts[i].p[2]-verts[i].terrainZ).filter(Number.isFinite).sort((a,b)=>a-b);
-        if(bottomGaps.length>=3){
-          const p15=percentile(bottomGaps,0.15);
-          const p85=percentile(bottomGaps,0.85);
-          const bottomShiftMm=Math.max(0,p85+embedMm);
-          const bottomShiftM=bottomShiftMm/Math.max(1e-9,t.dims.mmPerMeter);
-          if(p15/Math.max(1e-9,t.dims.mmPerMeter) > 0.35 && bottomShiftM > 0.10 && bottomShiftM < 15){
+
+      // Fuer offene Ruinen die vertikale Lage nur robust am Sockel korrigieren.
+      // NIE nach dem groessten Abstand absenken: das hat in 8.3.2 ganze Ruinen
+      // unter hoch liegendes Terrain gezogen. Stattdessen medianartigen Sockel-
+      // versatz entfernen und Restunterschiede lokal nach unten verlaengern.
+      const bottomIdx=ruinBottomBoundaryIndices(tris0,verts);
+      if(bottomIdx.length>=3){
+        const gaps=bottomIdx.map(i=>verts[i].p[2]-verts[i].terrainZ).filter(Number.isFinite).sort((a,b)=>a-b);
+        if(gaps.length>=3){
+          const robustGapMm=percentile(gaps,0.35);
+          const robustGapM=robustGapMm/Math.max(1e-9,t.dims.mmPerMeter);
+          if(robustGapM>0.45 && robustGapM<12){
+            // Ziel: typische Unterkante knapp unter Terrain, nicht die gesamte
+            // hoechste Terrainstelle erzwingen.
+            const shiftMm=Math.max(0,robustGapMm+embedMm);
+            const shiftM=shiftMm/Math.max(1e-9,t.dims.mmPerMeter);
             for(const vi of new Set(vis)){
-              verts[vi].p[2]-=bottomShiftMm;
-              verts[vi].correctedH-=bottomShiftM;
+              verts[vi].p[2]-=shiftMm;
+              verts[vi].correctedH-=shiftM;
             }
-            debug(`Offene Ruinenmauer neu eingepasst: ${bottomIdx.length.toLocaleString('de-CH')} Randpunkte · Basisabstand ${ (p15/Math.max(1e-9,t.dims.mmPerMeter)).toFixed(2)} m · starr ${bottomShiftM.toFixed(2)} m abgesenkt.`);
+            shiftedRoots.add(r);
+            floatingComponentsCorrected++;
+            floatingCorrectionMaxM=Math.max(floatingCorrectionMaxM,shiftM);
+            debug(`Offene Ruinenmauer starr eingepasst: ${bottomIdx.length.toLocaleString('de-CH')} Sockelpunkte · robuster Versatz ${robustGapM.toFixed(2)} m · Absenkung ${shiftM.toFixed(2)} m.`);
           }
         }
       }
+
+      // Verbleibende untere Randpunkte werden nur nach UNTEN bis ins lokale
+      // Terrain verlaengert. Dadurch folgt der Sockel unebenem Gelaende, ohne
+      // die Mauerkrone nochmals abzusenken.
+      let ruinFoundationExtended=0;
+      if(bottomIdx.length){
+        for(const vi of bottomIdx){
+          const v=verts[vi];
+          const target=v.terrainZ-embedMm;
+          if(v.p[2]>target){ v.p[2]=target; ruinFoundationExtended++; }
+        }
+        if(ruinFoundationExtended) debug(`Ruinenfundament lokal ins Terrain verlaengert: ${ruinFoundationExtended.toLocaleString('de-CH')} Randpunkte.`);
+      }
+
       // Nur echte Sockelpunkte dieses Gebäudes bis leicht ins Terrain ziehen.
       const foundationIdx=new Set();
       for(const [ia,ib,ic] of tris){
