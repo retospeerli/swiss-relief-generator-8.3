@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3';
+const APP_VERSION = '8.3.2';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -1532,6 +1532,79 @@ function appendValidatedCaps(out, loopSets, plane) {
   return {ok:true,count};
 }
 
+
+function buildingBoundaryLoops(tris) {
+  const edgeMap=new Map();
+  const add=(a,b)=>{
+    const k=a<b?`${a}|${b}`:`${b}|${a}`;
+    const rec=edgeMap.get(k) || {a,b,count:0};
+    rec.count++;
+    edgeMap.set(k,rec);
+  };
+  for(const [ia,ib,ic] of tris){ add(ia,ib); add(ib,ic); add(ic,ia); }
+  const boundary=[...edgeMap.values()].filter(e=>e.count===1);
+  if(!boundary.length) return [];
+  const adj=new Map();
+  const addAdj=(u,v,ei)=>{
+    if(!adj.has(u)) adj.set(u,[]);
+    adj.get(u).push({v,ei});
+  };
+  boundary.forEach((e,ei)=>{ addAdj(e.a,e.b,ei); addAdj(e.b,e.a,ei); });
+  const used=new Set();
+  const loops=[];
+  for(let i=0;i<boundary.length;i++){
+    if(used.has(i)) continue;
+    const e0=boundary[i];
+    used.add(i);
+    const path=[e0.a,e0.b];
+    let start=e0.a, prev=e0.a, curr=e0.b, guard=0, closed=false;
+    while(guard++<100000){
+      const opts=(adj.get(curr)||[]).filter(o=>!used.has(o.ei) && o.v!==prev);
+      const next=opts.length?opts[0]:null;
+      if(!next) break;
+      used.add(next.ei);
+      prev=curr; curr=next.v;
+      if(curr===start){ closed=true; break; }
+      path.push(curr);
+    }
+    loops.push({indices:path,closed});
+  }
+  return loops;
+}
+
+function classifyBoundaryLoops(loopInfo, verts){
+  const loops=loopInfo.filter(L=>L.indices.length>=3).map(L=>{
+    const idx=L.indices;
+    const zs=idx.map(i=>verts[i].p[2]).filter(Number.isFinite);
+    const gaps=idx.map(i=>verts[i].p[2]-verts[i].terrainZ).filter(Number.isFinite);
+    const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:NaN;
+    return { ...L, zMean:mean(zs), zMin:Math.min(...zs), zMax:Math.max(...zs), gapMean:mean(gaps), gapMin:Math.min(...gaps), gapMax:Math.max(...gaps) };
+  });
+  if(!loops.length) return {loops, top:[], bottom:[]};
+  const zMin=Math.min(...loops.map(l=>l.zMin));
+  const zMax=Math.max(...loops.map(l=>l.zMax));
+  const range=Math.max(1e-6,zMax-zMin);
+  const top=loops.filter(l=>l.closed && l.zMean>=zMin+0.55*range && l.gapMean>0.45);
+  const bottom=loops.filter(l=>l.zMean<=zMin+0.35*range);
+  return {loops,top,bottom};
+}
+
+function triangulateTopLoopIndices(loop, verts){
+  if(!loop.closed || loop.indices.length<3) return [];
+  const pts=loop.indices.map(i=>new THREE.Vector2(verts[i].p[0], verts[i].p[1]));
+  const tris=THREE.ShapeUtils.triangulateShape(pts,[]);
+  const out=[];
+  for(const tr of tris){
+    const ia=loop.indices[tr[0]], ib=loop.indices[tr[1]], ic=loop.indices[tr[2]];
+    const A=verts[ia].p, B=verts[ib].p, C=verts[ic].p;
+    const ux=B[0]-A[0], uy=B[1]-A[1], uz=B[2]-A[2];
+    const vx=C[0]-A[0], vy=C[1]-A[1], vz=C[2]-A[2];
+    const nz=ux*vy-uy*vx;
+    out.push(nz>=0 ? [ia,ib,ic] : [ia,ic,ib]);
+  }
+  return out;
+}
+
 function triangleIndices(idx, ti){
   return idx ? [idx.getX(ti*3),idx.getX(ti*3+1),idx.getX(ti*3+2)] : [ti*3,ti*3+1,ti*3+2];
 }
@@ -2007,9 +2080,41 @@ async function loadBuildingTriangles(t) {
       }
     }
 
-    for(const [r,tris] of compTris){
+    for(const [r,tris0] of compTris){
       const vis=compVerts.get(r)||[];
       if(!vis.length) continue;
+
+      let tris=tris0.slice();
+      let ruinTopCapsAdded=0;
+      const loopClass=classifyBoundaryLoops(buildingBoundaryLoops(tris), verts);
+      // Offen modellierte Ruinen-/Mauerobjekte: obere Rand-Schlaufen sauber deckeln.
+      for(const loop of loopClass.top){
+        const add=triangulateTopLoopIndices(loop, verts);
+        if(add.length){ tris.push(...add); ruinTopCapsAdded += add.length; }
+      }
+      if(ruinTopCapsAdded){
+        debug(`Ruinen-/Maueroberseiten geschlossen: ${ruinTopCapsAdded.toLocaleString('de-CH')} Dreiecke.`);
+      }
+      // Offene Ruinen schweben oft als ganzer Körper über dem Gelände. Verwende
+      // die unteren offenen Randschlaufen als robustere Fundamentreferenz und
+      // senke den ganzen Baukörper starr zusätzlich ab.
+      if(loopClass.bottom.length){
+        const bottomIdx=[...new Set(loopClass.bottom.flatMap(l=>l.indices))];
+        const bottomGaps=bottomIdx.map(i=>verts[i].p[2]-verts[i].terrainZ).filter(Number.isFinite).sort((a,b)=>a-b);
+        if(bottomGaps.length>=3){
+          const p15=percentile(bottomGaps,0.15);
+          const p85=percentile(bottomGaps,0.85);
+          const bottomShiftMm=Math.max(0,p85+embedMm);
+          const bottomShiftM=bottomShiftMm/Math.max(1e-9,t.dims.mmPerMeter);
+          if(p15/Math.max(1e-9,t.dims.mmPerMeter) > 0.35 && bottomShiftM > 0.10 && bottomShiftM < 15){
+            for(const vi of new Set(vis)){
+              verts[vi].p[2]-=bottomShiftMm;
+              verts[vi].correctedH-=bottomShiftM;
+            }
+            debug(`Offene Ruinenmauer neu eingepasst: ${bottomIdx.length.toLocaleString('de-CH')} Randpunkte · Basisabstand ${ (p15/Math.max(1e-9,t.dims.mmPerMeter)).toFixed(2)} m · starr ${bottomShiftM.toFixed(2)} m abgesenkt.`);
+          }
+        }
+      }
       // Nur echte Sockelpunkte dieses Gebäudes bis leicht ins Terrain ziehen.
       const foundationIdx=new Set();
       for(const [ia,ib,ic] of tris){
@@ -2290,6 +2395,38 @@ function clipPolyAgainstConvexXY(poly, clip) {
   return out;
 }
 
+
+function clipBoundarySegmentsForEdge(p, q, clip) {
+  // Return every rounded-rectangle segment on which BOTH endpoints lie.
+  // This is the key to a watertight wall: the wall is generated from the
+  // exact boundary edges produced by clipping the terrain triangles.
+  const hits = [];
+  const eps = 1e-5;
+  const onSegment = (v, a, b) => {
+    const dx=b[0]-a[0], dy=b[1]-a[1];
+    const l2=dx*dx+dy*dy;
+    if (l2 < 1e-16) return false;
+    const cross=Math.abs(dx*(v[1]-a[1]) - dy*(v[0]-a[0]));
+    if (cross > eps*Math.sqrt(l2)) return false;
+    const t=((v[0]-a[0])*dx + (v[1]-a[1])*dy)/l2;
+    return t >= -eps && t <= 1+eps;
+  };
+  for (let i=0;i<clip.length;i++) {
+    const a=clip[i], b=clip[(i+1)%clip.length];
+    if (onSegment(p,a,b) && onSegment(q,a,b)) hits.push(i);
+  }
+  return hits;
+}
+
+function clippedPolyBoundaryEdges(poly, clip) {
+  const edges=[];
+  for (let i=0;i<poly.length;i++) {
+    const a=poly[i], b=poly[(i+1)%poly.length];
+    if (clipBoundarySegmentsForEdge(a,b,clip).length) edges.push([a,b]);
+  }
+  return edges;
+}
+
 function terrainZAtModelXY(t, x, y) {
   const {cols,rows,values}=t.grid;
   const w=t.dims.widthMm, h=t.dims.depthMm;
@@ -2321,17 +2458,22 @@ function buildBinaryStl(t, buildingTriangles = null) {
     return clipPolyAgainstConvexXY(triPts,clip);
   };
 
-  // First pass: exact triangle count. Most terrain triangles are already fully
-  // inside, so clipping work is limited to the four 5-mm corner zones.
-  let topTriCount=0;
+  // First pass: exact triangle count AND exact terrain-boundary edge count.
+  // The side wall must use those very same boundary edges. A wall sampled only
+  // at the rounded-rectangle control points can bridge over an irregular terrain
+  // edge and leave visible gaps.
+  let topTriCount=0, boundaryEdgeCount=0;
   for (let r=0;r<rows-1;r++) for (let c=0;c<cols-1;c++) {
     const p00=point(r,c), p10=point(r,c+1), p01=point(r+1,c), p11=point(r+1,c+1);
     for (const src of [[p00,p01,p10],[p10,p01,p11]]) {
       const poly=clippedTopPoly(src);
-      if (poly.length>=3) topTriCount += poly.length-2;
+      if (poly.length>=3) {
+        topTriCount += poly.length-2;
+        boundaryEdgeCount += clippedPolyBoundaryEdges(poly,clip).length;
+      }
     }
   }
-  const sideTriangles = clip.length * 2;
+  const sideTriangles = boundaryEdgeCount * 2;
   const bottomTriangles = clip.length;
   const triCount = topTriCount + sideTriangles + bottomTriangles + buildingTriCount;
   const buffer = new ArrayBuffer(84 + triCount * 50);
@@ -2352,22 +2494,21 @@ function buildBinaryStl(t, buildingTriangles = null) {
   };
 
   // Terrainoberfläche exakt auf die abgerundete Grundform clippen.
+  // Gleichzeitig werden die Seitenwände AUS DEN EXAKT GLEICHEN Randkanten
+  // erzeugt. Dadurch haben Terrainoberseite und Wand identische 3D-Kanten und
+  // können selbst bei stark wechselnder Geländehöhe nicht auseinanderlaufen.
   for (let r=0;r<rows-1;r++) for (let c=0;c<cols-1;c++) {
     const p00=point(r,c), p10=point(r,c+1), p01=point(r+1,c), p11=point(r+1,c+1);
     for (const src of [[p00,p01,p10],[p10,p01,p11]]) {
       const poly=clippedTopPoly(src);
       for (let i=1;i<poly.length-1;i++) tri(poly[0],poly[i],poly[i+1]);
+      for (const [A,B] of clippedPolyBoundaryEdges(poly,clip)) {
+        const ba=[A[0],A[1],0], bb=[B[0],B[1],0];
+        // A and B already carry the exact Z values from the clipped terrain
+        // triangle; do not resample them independently.
+        tri(A,ba,B); tri(B,ba,bb);
+      }
     }
-  }
-
-  // Vertikale Seitenwand: vier gerade Seiten plus vier echte R=5-mm-Bögen.
-  // Unten endet die Wand ohne Fase direkt in z=0: die Druckplattenkante bleibt scharf.
-  for (let i=0;i<clip.length;i++) {
-    const A=clip[i], B=clip[(i+1)%clip.length];
-    const ta=[A[0],A[1],terrainZAtModelXY(t,A[0],A[1])];
-    const tb=[B[0],B[1],terrainZAtModelXY(t,B[0],B[1])];
-    const ba=[A[0],A[1],0], bb=[B[0],B[1],0];
-    tri(ta,ba,tb); tri(tb,ba,bb);
   }
 
   // Plane Bodenfläche mit scharfer umlaufender Unterkante.
