@@ -1,4 +1,20 @@
-## v8.3
+## v8.3.4
+
+- offene, parallele Mauerkronen von Ruinen werden nun als lokale Streifen trianguliert und geschlossen
+- grosse Delaunay-Bruecken ueber Innenhoefe/getrennte Mauern werden per lokaler Kantenlaenge verworfen
+
+## v8.3.3
+
+- Ruinen: robuste starre Sockelkorrektur statt maximaler Absenkung
+- verbleibende Fundamentunterschiede werden lokal ins Terrain verlaengert
+- offene Mauerkronen werden gedeckelt
+- normale Gebaeudegeometrie bleibt starr gekoppelt
+
+## v8.3.1
+
+Fix: Die komplette Seitenwand wird jetzt aus exakt denselben Randkanten wie die geclippte Terrainoberfläche erzeugt. Gerade Seiten und R=5-mm-Rundungen schliessen dadurch bis zur tatsächlichen Geländekante sauber und wasserdicht ab. Die Unterkante zur Druckplatte bleibt scharf.
+
+## v8.3.1
 
 - Vier vertikale Modellecken mit festem Radius 5 mm abgerundet.
 - Radius bleibt unabhängig von Modellgrösse immer 5 mm.

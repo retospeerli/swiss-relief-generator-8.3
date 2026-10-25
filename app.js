@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3.3';
+const APP_VERSION = '8.3.4';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -1604,6 +1604,104 @@ function ruinBottomBoundaryIndices(tris, verts) {
   return [...new Set(desc.filter(d=>d.z<=zMin+0.40*range).flatMap(d=>d.l.indices))];
 }
 
+
+function dedupeTopBoundaryPoints(tris, verts) {
+  const edges=new Map();
+  const add=(a,b)=>{
+    const k=a<b?`${a}|${b}`:`${b}|${a}`;
+    const e=edges.get(k)||{a,b,count:0}; e.count++; edges.set(k,e);
+  };
+  for(const [a,b,c] of tris){ add(a,b);add(b,c);add(c,a); }
+  const boundary=[...edges.values()].filter(e=>e.count===1);
+  if(!boundary.length) return [];
+  const ids=[...new Set(boundary.flatMap(e=>[e.a,e.b]))];
+  const zvals=ids.map(i=>verts[i].p[2]).filter(Number.isFinite).sort((a,b)=>a-b);
+  if(zvals.length<4) return [];
+  const z20=percentile(zvals,0.20), z90=percentile(zvals,0.90);
+  const range=Math.max(1e-6,z90-z20);
+  // Only boundary vertices in the upper portion of the open shell. Terrain gap
+  // excludes foundation openings. For low ruins the relative criterion is more
+  // important than an absolute height threshold.
+  const cand=ids.filter(i=>{
+    const v=verts[i], gap=v.p[2]-v.terrainZ;
+    return Number.isFinite(gap) && gap>0.25 && v.p[2]>=z20+0.50*range;
+  });
+  const byXY=new Map();
+  for(const i of cand){
+    const v=verts[i];
+    const k=`${Math.round(v.p[0]*10000)}:${Math.round(v.p[1]*10000)}`;
+    const old=byXY.get(k);
+    if(old==null || verts[i].p[2]>verts[old].p[2]) byXY.set(k,i);
+  }
+  return [...byXY.values()];
+}
+
+function circumcircle2D(a,b,c){
+  const ax=a.x,ay=a.y,bx=b.x,by=b.y,cx=c.x,cy=c.y;
+  const d=2*(ax*(by-cy)+bx*(cy-ay)+cx*(ay-by));
+  if(Math.abs(d)<1e-12) return null;
+  const aa=ax*ax+ay*ay, bb=bx*bx+by*by, cc=cx*cx+cy*cy;
+  const ux=(aa*(by-cy)+bb*(cy-ay)+cc*(ay-by))/d;
+  const uy=(aa*(cx-bx)+bb*(ax-cx)+cc*(bx-ax))/d;
+  const r2=(ux-ax)*(ux-ax)+(uy-ay)*(uy-ay);
+  return {x:ux,y:uy,r2};
+}
+
+function delaunay2D(points){
+  if(points.length<3) return [];
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  for(const p of points){minX=Math.min(minX,p.x);maxX=Math.max(maxX,p.x);minY=Math.min(minY,p.y);maxY=Math.max(maxY,p.y);}
+  const dx=maxX-minX,dy=maxY-minY,delta=Math.max(dx,dy,1),mx=(minX+maxX)/2,my=(minY+maxY)/2;
+  const pts=points.concat([{x:mx-20*delta,y:my-10*delta},{x:mx,y:my+20*delta},{x:mx+20*delta,y:my-10*delta}]);
+  const n=points.length;
+  let tris=[[n,n+1,n+2]];
+  for(let pi=0;pi<n;pi++){
+    const p=pts[pi], bad=[];
+    for(let ti=0;ti<tris.length;ti++){
+      const t=tris[ti], cc=circumcircle2D(pts[t[0]],pts[t[1]],pts[t[2]]);
+      if(cc && (p.x-cc.x)**2+(p.y-cc.y)**2 <= cc.r2+1e-9) bad.push(ti);
+    }
+    const edgeCount=new Map();
+    const addEdge=(a,b)=>{const k=a<b?`${a}|${b}`:`${b}|${a}`;const e=edgeCount.get(k)||{a,b,count:0};e.count++;edgeCount.set(k,e);};
+    for(const ti of bad){const t=tris[ti];addEdge(t[0],t[1]);addEdge(t[1],t[2]);addEdge(t[2],t[0]);}
+    const badSet=new Set(bad); tris=tris.filter((_,i)=>!badSet.has(i));
+    for(const e of edgeCount.values()) if(e.count===1) tris.push([e.a,e.b,pi]);
+  }
+  return tris.filter(t=>t[0]<n&&t[1]<n&&t[2]<n);
+}
+
+function capOpenRuinTopStrips(tris, verts){
+  const ids=dedupeTopBoundaryPoints(tris,verts);
+  if(ids.length<4) return {tris:[],count:0};
+  const pts=ids.map(i=>({x:verts[i].p[0],y:verts[i].p[1],i}));
+  // Typical local point spacing controls the bridge limit. This deliberately
+  // prevents Delaunay from spanning courtyards or separate wall fragments.
+  const nn=[];
+  for(let a=0;a<pts.length;a++){
+    let best=Infinity;
+    for(let b=0;b<pts.length;b++) if(a!==b){const d=Math.hypot(pts[a].x-pts[b].x,pts[a].y-pts[b].y);if(d>1e-6&&d<best)best=d;}
+    if(Number.isFinite(best))nn.push(best);
+  }
+  if(!nn.length) return {tris:[],count:0};
+  nn.sort((a,b)=>a-b);
+  const typical=Math.max(0.03,percentile(nn,0.60));
+  const maxEdge=Math.max(typical*3.2, Math.min(2.0, typical+0.9));
+  const raw=delaunay2D(pts);
+  const added=[];
+  for(const tr of raw){
+    const A=pts[tr[0]],B=pts[tr[1]],C=pts[tr[2]];
+    const e1=Math.hypot(A.x-B.x,A.y-B.y),e2=Math.hypot(B.x-C.x,B.y-C.y),e3=Math.hypot(C.x-A.x,C.y-A.y);
+    if(Math.max(e1,e2,e3)>maxEdge) continue;
+    const area=Math.abs((B.x-A.x)*(C.y-A.y)-(B.y-A.y)*(C.x-A.x))*0.5;
+    if(area<1e-7) continue;
+    const ia=A.i,ib=B.i,ic=C.i;
+    const va=verts[ia].p,vb=verts[ib].p,vc=verts[ic].p;
+    const nz=(vb[0]-va[0])*(vc[1]-va[1])-(vb[1]-va[1])*(vc[0]-va[0]);
+    added.push(nz>=0?[ia,ib,ic]:[ia,ic,ib]);
+  }
+  return {tris:added,count:added.length,points:ids.length,maxEdge};
+}
+
 function triangleIndices(idx, ti){
   return idx ? [idx.getX(ti*3),idx.getX(ti*3+1),idx.getX(ti*3+2)] : [ti*3,ti*3+1,ti*3+2];
 }
@@ -2084,11 +2182,18 @@ async function loadBuildingTriangles(t) {
       if(!vis.length) continue;
       let tris=tris0.slice();
 
-      // Ruinen / offene Mauerkoerper: erst die obere offene Randkontur deckeln.
+      // Ruinen / offene Mauerkoerper: zuerst echte geschlossene Randkonturen
+      // deckeln. Danach auch offene, parallele Mauerkronen als lokale Streifen
+      // triangulieren; genau dieser Fall fehlt bei vielen swissBUILDINGS3D-Ruinen.
       const topCaps=capClosedTopBoundaryLoops(tris,verts);
       if(topCaps.count){
         tris.push(...topCaps.tris);
-        debug(`Ruinen-/Maueroberseite geschlossen: ${topCaps.count.toLocaleString('de-CH')} Dreiecke.`);
+        debug(`Geschlossene Ruinen-/Maueroberseite: ${topCaps.count.toLocaleString('de-CH')} Dreiecke.`);
+      }
+      const stripCaps=capOpenRuinTopStrips(tris0,verts);
+      if(stripCaps.count){
+        tris.push(...stripCaps.tris);
+        debug(`Offene Mauerkronen als Streifen geschlossen: ${stripCaps.count.toLocaleString('de-CH')} Dreiecke aus ${stripCaps.points} Randpunkten · Brueckengrenze ${stripCaps.maxEdge.toFixed(2)} mm.`);
       }
 
       // Fuer offene Ruinen die vertikale Lage nur robust am Sockel korrigieren.
