@@ -1,3 +1,11 @@
+## v8.3.8
+
+- entfernt die fehlerhafte starre 1-km-Kachel-Z-Korrektur aus v8.3.6/v8.3.7
+- pro swissALTI³D-Kachel wird genau eine deterministische Primärquelle gewählt
+- bei Downloadfehlern wird dieselbe Quelle wiederholt; kein Wechsel auf älteren Jahrgang
+- lieber Abbruch als Mischung verschiedener Terrainstände
+- Gebäudelogik bleibt auf stabilem Stand v8.3.1
+
 ## v8.3.7
 
 - Priorität normale Gebäude: Gebäudegenerierung vollständig auf stabilen Stand v8.3.1 zurückgesetzt.

@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3.7';
+const APP_VERSION = '8.3.8';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -585,19 +585,24 @@ function makeTilePlans(items, preferredResolution) {
   const fallbackResolution = preferredResolution === 0.5 ? 2 : 0.5;
   const plans = [];
   for (const [key, versions] of groups) {
-    const candidates = [];
-    // First try newest versions in the requested/automatic resolution.
+    // v8.3.8: pro räumlicher Kachel genau EINE deterministische Primärquelle.
+    // Niemals wegen eines temporären Downloadfehlers auf einen älteren Jahrgang
+    // wechseln: genau dieses Mischen kann rechteckige Kachelunterschiede erzeugen.
+    let chosen = null;
     for (const item of versions) {
       const asset = findGeoTiffAsset(item, preferredResolution);
-      if (asset) candidates.push({ item, asset, resolution: preferredResolution });
+      if (asset) { chosen = { item, asset, resolution: preferredResolution }; break; }
     }
-    // If that fails, prefer 2 m as a compact and very robust fallback.
-    // For a forced 2 m request we only add 0.5 m after all 2 m versions.
-    for (const item of versions) {
-      const asset = findGeoTiffAsset(item, fallbackResolution);
-      if (asset) candidates.push({ item, asset, resolution: fallbackResolution });
+    // Nur wenn für diese räumliche Kachel die gewünschte Auflösung überhaupt
+    // nicht publiziert ist, darf die alternative Auflösung als feste Primärquelle
+    // verwendet werden. Auch dann nur der neueste verfügbare Stand.
+    if (!chosen) {
+      for (const item of versions) {
+        const asset = findGeoTiffAsset(item, fallbackResolution);
+        if (asset) { chosen = { item, asset, resolution: fallbackResolution }; break; }
+      }
     }
-    if (candidates.length) plans.push({ key, candidates });
+    if (chosen) plans.push({ key, candidates: [chosen], primary: chosen });
   }
   return plans;
 }
@@ -778,22 +783,19 @@ async function sampleTile(url, d, grid, resolution = 2, options = {}) {
 
 async function loadTilePlan(plan, d, grid) {
   const errors = [];
-  for (let ci = 0; ci < plan.candidates.length; ci++) {
-    const candidate = plan.candidates[ci];
-    // Die bevorzugte (neueste) Quelle zweimal als vollständigen Tile-Versuch
-    // probieren, bevor wegen eines temporären Netz-/Range-Fehlers auf einen
-    // älteren Jahrgang oder die Alternativauflösung ausgewichen wird.
-    const attempts = ci === 0 ? 2 : 1;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        const written = await sampleTile(candidate.asset.href, d, grid, candidate.resolution);
-        if (written > 0) return { written, candidate, errors };
-        errors.push(`${candidate.item.id} (${candidate.resolution} m), Versuch ${attempt}: kein Überlappungsbereich`);
-        break;
-      } catch (err) {
-        errors.push(`${candidate.item.id} (${candidate.resolution} m), Versuch ${attempt}: ${err.message}`);
-        if (attempt < attempts) await sleep(650);
-      }
+  const candidate = plan.candidates[0];
+  if (!candidate) return { written: 0, candidate: null, errors:['keine Primärquelle'] };
+  // Mehrfach dieselbe Quelle versuchen. Kein Jahrgangs-/Auflösungswechsel nach
+  // Netzfehlern. Lieber Generation abbrechen als verschiedene Terrainstände mischen.
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const written = await sampleTile(candidate.asset.href, d, grid, candidate.resolution);
+      if (written > 0) return { written, candidate, errors };
+      errors.push(`${candidate.item.id} (${candidate.resolution} m), Versuch ${attempt}: kein Überlappungsbereich`);
+      break;
+    } catch (err) {
+      errors.push(`${candidate.item.id} (${candidate.resolution} m), Versuch ${attempt}: ${err.message}`);
+      if (attempt < 4) await sleep(650 * attempt);
     }
   }
   return { written: 0, candidate: null, errors };
@@ -2299,7 +2301,7 @@ async function generateTerrain() {
     const items = await fetchStacItemsForBbox(catalogueBbox);
     debug(`${items.length} STAC-Items gefunden.`);
     const plans = makeTilePlans(items, sourceRes);
-    debug(`${plans.length} räumliche 1-km-Kacheln geplant; Fallback-Jahrgänge und Alternativauflösung verfügbar.`);
+    debug(`${plans.length} räumliche 1-km-Kacheln geplant; deterministische Primärquelle je Kachel; kein Jahrgangs-Fallback bei Downloadfehlern.`);
     if (!plans.length) throw new Error(`Keine swissALTI³D-GeoTIFFs für diesen Ausschnitt gefunden.`);
     if (plans.length > MAX_TILES) throw new Error(`${plans.length} Kacheln wären nötig. Bitte einen kleineren Ausschnitt wählen.`);
 
@@ -2307,7 +2309,7 @@ async function generateTerrain() {
       const pct = 12 + 68 * (done / total);
       setStatus(`Höhendaten ${done}/${total} · ${TILE_CONCURRENCY} parallele Downloads`, pct);
     });
-    if (loadResult.fallbackUsed.length) debug(`${loadResult.fallbackUsed.length} Kacheln erfolgreich über Fallback geladen.`);
+    if (loadResult.fallbackUsed.length) debug(`${loadResult.fallbackUsed.length} Kacheln mit alternativer Primärquelle geladen.`);
     if (loadResult.failed.length) {
       debug(`${loadResult.failed.length} Kacheln nach allen Versuchen nicht geladen:`);
       for (const f of loadResult.failed.slice(0, 30)) debug(`  ${f.plan.key}: ${f.errors.slice(-2).join(' | ')}`);
@@ -2344,21 +2346,7 @@ async function generateTerrain() {
       filled = fillSmallGaps(grid, 20);
     }
 
-    // Final 1-km seam consistency check. This runs only after all normal and
-    // fallback sources are loaded, so a temporary fallback cannot silently
-    // leave one rectangular tile a few decimetres above/below its neighbours.
-    setStatus('Kachelgrenzen auf Höhenversatz prüfen', 96);
-    const seamFix = harmonizeSwissAltiTileSeams(grid, d);
-    if (seamFix.corrected) {
-      debug(`Kachelnaht-Korrektur: ${seamFix.tiles} Kachel(n) starr angepasst · ${seamFix.constraints} belastbare Naht(en) · max. Korrektur ${seamFix.maxCorrection.toFixed(3)} m.`);
-      for (const e of seamFix.details.filter(e=>Math.abs(e.measured)>=0.08).slice(0,20)) {
-        debug(`  Naht ${e.a} ↔ ${e.b}: gemessener Offset ${e.measured>=0?'+':''}${e.measured.toFixed(3)} m · Streuung ${e.mad.toFixed(3)} m · n=${e.n}`);
-      }
-    } else if (seamFix.constraints) {
-      debug(`Kachelnaht-Prüfung: ${seamFix.constraints} mögliche Naht(en) geprüft; keine relevante Kachelverschiebung nötig.`);
-    } else {
-      debug('Kachelnaht-Prüfung: keine systematische 1-km-Höhenstufe erkannt.');
-    }
+    debug('Kachelregel v8.3.8: keine nachträgliche starre Z-Verschiebung einzelner 1-km-Kacheln.');
     const stats = terrainStats(grid);
     const missingPct = stats.missing / stats.total * 100;
     debug(`Raster: ${grid.cols} × ${grid.rows}; Erstbelegung: ${loadResult.totalWritten}; swissALTI³D-Recovery: ${recovery.recovered}; swissALTIRegio: ${regioRecovery.recovered}; isoliert interpoliert: ${filled}; Restlücken: ${missingPct.toFixed(4)} %`);
