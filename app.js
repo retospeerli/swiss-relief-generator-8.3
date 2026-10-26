@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3.4';
+const APP_VERSION = '8.3.6';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -778,13 +778,22 @@ async function sampleTile(url, d, grid, resolution = 2, options = {}) {
 
 async function loadTilePlan(plan, d, grid) {
   const errors = [];
-  for (const candidate of plan.candidates) {
-    try {
-      const written = await sampleTile(candidate.asset.href, d, grid, candidate.resolution);
-      if (written > 0) return { written, candidate, errors };
-      errors.push(`${candidate.item.id} (${candidate.resolution} m): kein Überlappungsbereich`);
-    } catch (err) {
-      errors.push(`${candidate.item.id} (${candidate.resolution} m): ${err.message}`);
+  for (let ci = 0; ci < plan.candidates.length; ci++) {
+    const candidate = plan.candidates[ci];
+    // Die bevorzugte (neueste) Quelle zweimal als vollständigen Tile-Versuch
+    // probieren, bevor wegen eines temporären Netz-/Range-Fehlers auf einen
+    // älteren Jahrgang oder die Alternativauflösung ausgewichen wird.
+    const attempts = ci === 0 ? 2 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const written = await sampleTile(candidate.asset.href, d, grid, candidate.resolution);
+        if (written > 0) return { written, candidate, errors };
+        errors.push(`${candidate.item.id} (${candidate.resolution} m), Versuch ${attempt}: kein Überlappungsbereich`);
+        break;
+      } catch (err) {
+        errors.push(`${candidate.item.id} (${candidate.resolution} m), Versuch ${attempt}: ${err.message}`);
+        if (attempt < attempts) await sleep(650);
+      }
     }
   }
   return { written: 0, candidate: null, errors };
@@ -843,10 +852,161 @@ function fillSmallGaps(grid, passes = 12) {
   return totalChanged;
 }
 
-// Remove only step-like artefacts exactly on the 1-km swissALTI tile grid.
-// We compare the cross-boundary jump with the local slopes on both sides and
-// distribute only the anomalous component over a few cells. Genuine terrain
-// slope is retained; this is deliberately not a global blur.
+// Robust post-check for systematic vertical offsets between neighbouring
+// 1-km swissALTI³D tiles. This is intentionally NOT a blur: a whole affected
+// tile receives one small rigid Z correction derived from both sides of its
+// shared seam. True local slope is estimated independently on each side.
+function gridElevationAtWorld(grid, d, x, y) {
+  const { cf, rf, lx, ly } = worldToGridFraction(d, grid, x, y);
+  if (Math.abs(lx) > d.groundW/2 + 1e-6 || Math.abs(ly) > d.groundH/2 + 1e-6) return NaN;
+  if (cf < 0 || rf < 0 || cf > grid.cols-1 || rf > grid.rows-1) return NaN;
+  const c0=Math.floor(cf), r0=Math.floor(rf);
+  const c1=Math.min(grid.cols-1,c0+1), r1=Math.min(grid.rows-1,r0+1);
+  const tx=cf-c0, ty=rf-r0;
+  const v00=grid.values[r0*grid.cols+c0], v10=grid.values[r0*grid.cols+c1];
+  const v01=grid.values[r1*grid.cols+c0], v11=grid.values[r1*grid.cols+c1];
+  if (![v00,v10,v01,v11].every(Number.isFinite)) return NaN;
+  return (v00*(1-tx)+v10*tx)*(1-ty) + (v01*(1-tx)+v11*tx)*ty;
+}
+
+function robustMedian(values) {
+  if (!values.length) return NaN;
+  const a=values.slice().sort((x,y)=>x-y);
+  const m=Math.floor(a.length/2);
+  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
+}
+
+function tileNodeKey(tx,ty){ return `${tx},${ty}`; }
+
+function estimateTileSeamConstraints(grid, d) {
+  const sx=d.groundW/Math.max(1,grid.cols-1), sy=d.groundH/Math.max(1,grid.rows-1);
+  const meshM=Math.max(sx,sy);
+  const delta=Math.max(4,Math.min(65,meshM*2.25));
+  const sampleStep=Math.max(65,Math.min(180,delta*3.0));
+  const constraints=[];
+  const minTx=Math.floor(d.minX/1000)-1, maxTx=Math.floor(d.maxX/1000)+1;
+  const minTy=Math.floor(d.minY/1000)-1, maxTy=Math.floor(d.maxY/1000)+1;
+
+  const accept=(a,b,errs,axis,seamCoord)=>{
+    if(errs.length<4) return;
+    const med=robustMedian(errs);
+    const mad=robustMedian(errs.map(v=>Math.abs(v-med)));
+    const abs=Math.abs(med);
+    // Below 8 cm is irrelevant for a printed relief. Above 1.75 m is much
+    // more likely real terrain / incompatible source and is deliberately not
+    // auto-corrected. A coherent seam has low scatter along its shared edge.
+    if(abs < 0.08 || abs > 1.75) return;
+    if(mad > Math.max(0.22, abs*0.75)) return;
+    constraints.push({a,b,target:-med,measured:med,mad,n:errs.length,axis,seamCoord,weight:errs.length/Math.max(0.06,mad+0.04)});
+  };
+
+  // Vertical 1-km seams: left tile -> right tile.
+  for(let tx=minTx;tx<maxTx;tx++){
+    const x=(tx+1)*1000;
+    if(x<=d.minX+2*delta || x>=d.maxX-2*delta) continue;
+    for(let ty=minTy;ty<=maxTy;ty++){
+      const y0=Math.max(d.minY+2*delta,ty*1000+2*delta);
+      const y1=Math.min(d.maxY-2*delta,(ty+1)*1000-2*delta);
+      if(y1<=y0) continue;
+      const errs=[];
+      for(let y=y0;y<=y1+1e-6;y+=sampleStep){
+        const l1=gridElevationAtWorld(grid,d,x-delta,y), l2=gridElevationAtWorld(grid,d,x-2*delta,y);
+        const r1=gridElevationAtWorld(grid,d,x+delta,y), r2=gridElevationAtWorld(grid,d,x+2*delta,y);
+        if([l1,l2,r1,r2].every(Number.isFinite)) errs.push((2*r1-r2)-(2*l1-l2));
+      }
+      accept(tileNodeKey(tx,ty),tileNodeKey(tx+1,ty),errs,'x',x);
+    }
+  }
+  // Horizontal 1-km seams: lower tile -> upper tile.
+  for(let ty=minTy;ty<maxTy;ty++){
+    const y=(ty+1)*1000;
+    if(y<=d.minY+2*delta || y>=d.maxY-2*delta) continue;
+    for(let tx=minTx;tx<=maxTx;tx++){
+      const x0=Math.max(d.minX+2*delta,tx*1000+2*delta);
+      const x1=Math.min(d.maxX-2*delta,(tx+1)*1000-2*delta);
+      if(x1<=x0) continue;
+      const errs=[];
+      for(let x=x0;x<=x1+1e-6;x+=sampleStep){
+        const b1=gridElevationAtWorld(grid,d,x,y-delta), b2=gridElevationAtWorld(grid,d,x,y-2*delta);
+        const t1=gridElevationAtWorld(grid,d,x,y+delta), t2=gridElevationAtWorld(grid,d,x,y+2*delta);
+        if([b1,b2,t1,t2].every(Number.isFinite)) errs.push((2*t1-t2)-(2*b1-b2));
+      }
+      accept(tileNodeKey(tx,ty),tileNodeKey(tx,ty+1),errs,'y',y);
+    }
+  }
+  return {constraints,delta,meshM};
+}
+
+function solveTileCorrections(constraints, d) {
+  if(!constraints.length) return new Map();
+  const neighbours=new Map();
+  const add=(k,rec)=>{ if(!neighbours.has(k)) neighbours.set(k,[]); neighbours.get(k).push(rec); };
+  for(const e of constraints){
+    // c_b - c_a = target
+    add(e.a,{other:e.b,delta:-e.target,w:e.weight}); // c_a = c_b - target
+    add(e.b,{other:e.a,delta:e.target,w:e.weight});  // c_b = c_a + target
+  }
+  const anchor=tileNodeKey(Math.floor(d.centerX/1000),Math.floor(d.centerY/1000));
+  const corr=new Map([...neighbours.keys()].map(k=>[k,0]));
+  if(!corr.has(anchor)) corr.set(anchor,0);
+  for(let iter=0;iter<120;iter++){
+    let maxChange=0;
+    const next=new Map(corr);
+    for(const [k,list] of neighbours){
+      if(k===anchor) { next.set(k,0); continue; }
+      let sum=0,ws=0;
+      for(const r of list){
+        if(!corr.has(r.other)) continue;
+        sum += (corr.get(r.other)+r.delta)*r.w;
+        ws += r.w;
+      }
+      if(!ws) continue;
+      const v=Math.max(-1.75,Math.min(1.75,sum/ws));
+      maxChange=Math.max(maxChange,Math.abs(v-(corr.get(k)||0)));
+      next.set(k,v);
+    }
+    for(const [k,v] of next) corr.set(k,v);
+    if(maxChange<1e-5) break;
+  }
+  return corr;
+}
+
+function correctionAtWorld(corr, x, y, blendM) {
+  const tx=Math.floor(x/1000), ty=Math.floor(y/1000);
+  let base=corr.get(tileNodeKey(tx,ty)) || 0;
+  let sum=base, w=1;
+  const fx=x-tx*1000, fy=y-ty*1000;
+  const mix=(other,dist)=>{
+    if(dist>=blendM) return;
+    const k=tileNodeKey(other[0],other[1]);
+    if(!corr.has(k)) return;
+    const a=0.5*(1-dist/blendM); // exactly on seam -> equal 50/50
+    sum += (corr.get(k)||0)*a;
+    w += a;
+  };
+  mix([tx-1,ty],fx); mix([tx+1,ty],1000-fx);
+  mix([tx,ty-1],fy); mix([tx,ty+1],1000-fy);
+  return sum/w;
+}
+
+function harmonizeSwissAltiTileSeams(grid, d) {
+  const est=estimateTileSeamConstraints(grid,d);
+  if(!est.constraints.length) return {corrected:false,constraints:0,tiles:0,maxCorrection:0,details:[]};
+  const corr=solveTileCorrections(est.constraints,d);
+  const significant=[...corr.entries()].filter(([,v])=>Math.abs(v)>=0.04);
+  if(!significant.length) return {corrected:false,constraints:est.constraints.length,tiles:0,maxCorrection:0,details:est.constraints};
+  const blendM=Math.max(1.0,Math.min(30,est.meshM*0.85));
+  for(let r=0;r<grid.rows;r++) for(let c=0;c<grid.cols;c++){
+    const i=r*grid.cols+c;
+    if(!Number.isFinite(grid.values[i])) continue;
+    const pt=gridPointWorld(d,grid,c,r);
+    grid.values[i] += correctionAtWorld(corr,pt.x,pt.y,blendM);
+  }
+  const maxCorrection=Math.max(...significant.map(([,v])=>Math.abs(v)));
+  return {corrected:true,constraints:est.constraints.length,tiles:significant.length,maxCorrection,details:est.constraints};
+}
+
+// Missing-coverage recovery works in the same 1-km tile index system.
 function missingTileKeys(grid, d, neighbourRing = 1) {
   const keys = new Set();
   for (let r = 0; r < grid.rows; r++) {
@@ -1605,101 +1765,163 @@ function ruinBottomBoundaryIndices(tris, verts) {
 }
 
 
-function dedupeTopBoundaryPoints(tris, verts) {
-  const edges=new Map();
+
+function topBoundaryEdges(tris, verts, t) {
+  const edgeMap=new Map();
   const add=(a,b)=>{
     const k=a<b?`${a}|${b}`:`${b}|${a}`;
-    const e=edges.get(k)||{a,b,count:0}; e.count++; edges.set(k,e);
+    const e=edgeMap.get(k)||{a,b,count:0}; e.count++; edgeMap.set(k,e);
   };
-  for(const [a,b,c] of tris){ add(a,b);add(b,c);add(c,a); }
-  const boundary=[...edges.values()].filter(e=>e.count===1);
+  for(const [a,b,c] of tris){ add(a,b); add(b,c); add(c,a); }
+  const boundary=[...edgeMap.values()].filter(e=>e.count===1);
   if(!boundary.length) return [];
-  const ids=[...new Set(boundary.flatMap(e=>[e.a,e.b]))];
-  const zvals=ids.map(i=>verts[i].p[2]).filter(Number.isFinite).sort((a,b)=>a-b);
-  if(zvals.length<4) return [];
-  const z20=percentile(zvals,0.20), z90=percentile(zvals,0.90);
-  const range=Math.max(1e-6,z90-z20);
-  // Only boundary vertices in the upper portion of the open shell. Terrain gap
-  // excludes foundation openings. For low ruins the relative criterion is more
-  // important than an absolute height threshold.
-  const cand=ids.filter(i=>{
-    const v=verts[i], gap=v.p[2]-v.terrainZ;
-    return Number.isFinite(gap) && gap>0.25 && v.p[2]>=z20+0.50*range;
+
+  // Every open edge is classified by its position relative to the terrain.
+  // Foundation openings sit at/near terrain; model-border cuts sit on the
+  // relief rectangle. Every remaining upper/open shell edge is a crown edge
+  // and MUST be closed.
+  const bx=t?.dims?.widthMm/2 ?? Infinity, by=t?.dims?.depthMm/2 ?? Infinity;
+  const borderTol=0.04;
+  const crown=[];
+  for(const e of boundary){
+    const A=verts[e.a], B=verts[e.b];
+    if(!A||!B) continue;
+    const ga=A.p[2]-A.terrainZ, gb=B.p[2]-B.terrainZ;
+    if(!Number.isFinite(ga)||!Number.isFinite(gb)) continue;
+    const onBorder=(v)=>Math.abs(Math.abs(v.p[0])-bx)<borderTol || Math.abs(Math.abs(v.p[1])-by)<borderTol;
+    if(onBorder(A)&&onBorder(B)) continue;
+    // Both endpoints must clearly belong above the foundation zone. This still
+    // allows sloping / broken ruin crowns; no global Z percentile is used.
+    if(Math.min(ga,gb) <= 0.22) continue;
+    const dx=B.p[0]-A.p[0], dy=B.p[1]-A.p[1], dz=B.p[2]-A.p[2];
+    const horiz=Math.hypot(dx,dy);
+    // Reject essentially vertical end edges. Crown edges may slope, but they
+    // must have a meaningful horizontal run.
+    if(horiz < 1e-5 || Math.abs(dz) > Math.max(1.2, horiz*3.5)) continue;
+    crown.push({a:e.a,b:e.b});
+  }
+  return crown;
+}
+
+function chainsFromEdges(edges){
+  if(!edges.length) return [];
+  const adj=new Map();
+  edges.forEach((e,ei)=>{
+    if(!adj.has(e.a)) adj.set(e.a,[]); if(!adj.has(e.b)) adj.set(e.b,[]);
+    adj.get(e.a).push({ei,v:e.b}); adj.get(e.b).push({ei,v:e.a});
   });
-  const byXY=new Map();
-  for(const i of cand){
-    const v=verts[i];
-    const k=`${Math.round(v.p[0]*10000)}:${Math.round(v.p[1]*10000)}`;
-    const old=byXY.get(k);
-    if(old==null || verts[i].p[2]>verts[old].p[2]) byXY.set(k,i);
-  }
-  return [...byXY.values()];
-}
-
-function circumcircle2D(a,b,c){
-  const ax=a.x,ay=a.y,bx=b.x,by=b.y,cx=c.x,cy=c.y;
-  const d=2*(ax*(by-cy)+bx*(cy-ay)+cx*(ay-by));
-  if(Math.abs(d)<1e-12) return null;
-  const aa=ax*ax+ay*ay, bb=bx*bx+by*by, cc=cx*cx+cy*cy;
-  const ux=(aa*(by-cy)+bb*(cy-ay)+cc*(ay-by))/d;
-  const uy=(aa*(cx-bx)+bb*(ax-cx)+cc*(bx-ax))/d;
-  const r2=(ux-ax)*(ux-ax)+(uy-ay)*(uy-ay);
-  return {x:ux,y:uy,r2};
-}
-
-function delaunay2D(points){
-  if(points.length<3) return [];
-  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
-  for(const p of points){minX=Math.min(minX,p.x);maxX=Math.max(maxX,p.x);minY=Math.min(minY,p.y);maxY=Math.max(maxY,p.y);}
-  const dx=maxX-minX,dy=maxY-minY,delta=Math.max(dx,dy,1),mx=(minX+maxX)/2,my=(minY+maxY)/2;
-  const pts=points.concat([{x:mx-20*delta,y:my-10*delta},{x:mx,y:my+20*delta},{x:mx+20*delta,y:my-10*delta}]);
-  const n=points.length;
-  let tris=[[n,n+1,n+2]];
-  for(let pi=0;pi<n;pi++){
-    const p=pts[pi], bad=[];
-    for(let ti=0;ti<tris.length;ti++){
-      const t=tris[ti], cc=circumcircle2D(pts[t[0]],pts[t[1]],pts[t[2]]);
-      if(cc && (p.x-cc.x)**2+(p.y-cc.y)**2 <= cc.r2+1e-9) bad.push(ti);
+  const used=new Set(), chains=[];
+  const walk=(start,ei0)=>{
+    const ids=[start]; let curr=start, prev=null, ei=ei0, guard=0;
+    while(ei!=null && guard++<100000){
+      if(used.has(ei)) break;
+      used.add(ei);
+      const e=edges[ei], next=e.a===curr?e.b:e.a;
+      ids.push(next); prev=curr; curr=next;
+      const opts=(adj.get(curr)||[]).filter(o=>!used.has(o.ei) && o.v!==prev);
+      ei=opts.length?opts[0].ei:null;
+      if(curr===start) break;
     }
-    const edgeCount=new Map();
-    const addEdge=(a,b)=>{const k=a<b?`${a}|${b}`:`${b}|${a}`;const e=edgeCount.get(k)||{a,b,count:0};e.count++;edgeCount.set(k,e);};
-    for(const ti of bad){const t=tris[ti];addEdge(t[0],t[1]);addEdge(t[1],t[2]);addEdge(t[2],t[0]);}
-    const badSet=new Set(bad); tris=tris.filter((_,i)=>!badSet.has(i));
-    for(const e of edgeCount.values()) if(e.count===1) tris.push([e.a,e.b,pi]);
+    return {indices:ids,closed:ids.length>2 && ids[ids.length-1]===start};
+  };
+  // Open chains first.
+  for(const [v,a] of adj){
+    if(a.length!==1) continue;
+    const ei=a[0].ei; if(!used.has(ei)) chains.push(walk(v,ei));
   }
-  return tris.filter(t=>t[0]<n&&t[1]<n&&t[2]<n);
+  for(let i=0;i<edges.length;i++) if(!used.has(i)) chains.push(walk(edges[i].a,i));
+  return chains.filter(c=>c.indices.length>=2);
 }
 
-function capOpenRuinTopStrips(tris, verts){
-  const ids=dedupeTopBoundaryPoints(tris,verts);
-  if(ids.length<4) return {tris:[],count:0};
-  const pts=ids.map(i=>({x:verts[i].p[0],y:verts[i].p[1],i}));
-  // Typical local point spacing controls the bridge limit. This deliberately
-  // prevents Delaunay from spanning courtyards or separate wall fragments.
-  const nn=[];
-  for(let a=0;a<pts.length;a++){
+function closeCrownChains(chains, verts){
+  const closed=[];
+  const open=[];
+  for(const c of chains){
+    let ids=c.indices.slice();
+    if(c.closed){ if(ids[0]===ids[ids.length-1]) ids.pop(); if(ids.length>=3) closed.push(ids); }
+    else open.push(ids);
+  }
+  if(!open.length) return closed;
+
+  // Estimate actual wall thickness from nearest distances between distinct
+  // crown chains. This makes the connector tolerance scale with the data,
+  // instead of an arbitrary global limit.
+  const nearest=[];
+  for(let i=0;i<open.length;i++){
     let best=Infinity;
-    for(let b=0;b<pts.length;b++) if(a!==b){const d=Math.hypot(pts[a].x-pts[b].x,pts[a].y-pts[b].y);if(d>1e-6&&d<best)best=d;}
-    if(Number.isFinite(best))nn.push(best);
+    for(let j=0;j<open.length;j++) if(i!==j){
+      for(const ia of open[i]) for(const ib of open[j]){
+        const A=verts[ia].p,B=verts[ib].p;
+        const d=Math.hypot(A[0]-B[0],A[1]-B[1]);
+        if(d>1e-5 && d<best) best=d;
+      }
+    }
+    if(Number.isFinite(best)) nearest.push(best);
   }
-  if(!nn.length) return {tris:[],count:0};
-  nn.sort((a,b)=>a-b);
-  const typical=Math.max(0.03,percentile(nn,0.60));
-  const maxEdge=Math.max(typical*3.2, Math.min(2.0, typical+0.9));
-  const raw=delaunay2D(pts);
+  const typical=nearest.length?percentile(nearest.sort((a,b)=>a-b),0.45):0.7;
+  const maxJoin=Math.max(0.45,Math.min(3.0,typical*2.8+0.25));
+
+  // Pair open chains by their endpoints. Test both orientations and choose the
+  // smallest total end-connector distance. A pair becomes one closed polygon:
+  // chain A forward -> connector -> chain B reverse -> connector.
+  const unused=new Set(open.map((_,i)=>i));
+  while(unused.size){
+    const i=unused.values().next().value; unused.delete(i);
+    const A=open[i]; if(A.length<2) continue;
+    let best=null;
+    for(const j of unused){
+      const B=open[j]; if(B.length<2) continue;
+      const a0=verts[A[0]].p, a1=verts[A[A.length-1]].p;
+      const b0=verts[B[0]].p, b1=verts[B[B.length-1]].p;
+      const d00=Math.hypot(a0[0]-b0[0],a0[1]-b0[1]);
+      const d11=Math.hypot(a1[0]-b1[0],a1[1]-b1[1]);
+      const d01=Math.hypot(a0[0]-b1[0],a0[1]-b1[1]);
+      const d10=Math.hypot(a1[0]-b0[0],a1[1]-b0[1]);
+      const same=d00+d11, cross=d01+d10;
+      const score=Math.min(same,cross);
+      const maxD=same<=cross?Math.max(d00,d11):Math.max(d01,d10);
+      if(maxD>maxJoin) continue;
+      if(!best||score<best.score) best={j,score,cross:cross<same,maxD};
+    }
+    if(!best) continue;
+    unused.delete(best.j);
+    const B=open[best.j];
+    const Bordered=best.cross?B.slice():B.slice().reverse();
+    const poly=[...A,...Bordered];
+    // Remove duplicate adjacent vertices.
+    const clean=[];
+    for(const id of poly) if(!clean.length||clean[clean.length-1]!==id) clean.push(id);
+    if(clean.length>=3) closed.push(clean);
+  }
+  closed.maxJoin=maxJoin;
+  closed.unpaired=unused.size;
+  return closed;
+}
+
+function capAllRuinCrowns(tris, verts, t){
+  const crownEdges=topBoundaryEdges(tris,verts,t);
+  if(!crownEdges.length) return {tris:[],count:0,edges:0,polygons:0,unclosed:0,maxJoin:0};
+  const chains=chainsFromEdges(crownEdges);
+  const polygons=closeCrownChains(chains,verts);
   const added=[];
-  for(const tr of raw){
-    const A=pts[tr[0]],B=pts[tr[1]],C=pts[tr[2]];
-    const e1=Math.hypot(A.x-B.x,A.y-B.y),e2=Math.hypot(B.x-C.x,B.y-C.y),e3=Math.hypot(C.x-A.x,C.y-A.y);
-    if(Math.max(e1,e2,e3)>maxEdge) continue;
-    const area=Math.abs((B.x-A.x)*(C.y-A.y)-(B.y-A.y)*(C.x-A.x))*0.5;
-    if(area<1e-7) continue;
-    const ia=A.i,ib=B.i,ic=C.i;
-    const va=verts[ia].p,vb=verts[ib].p,vc=verts[ic].p;
-    const nz=(vb[0]-va[0])*(vc[1]-va[1])-(vb[1]-va[1])*(vc[0]-va[0]);
-    added.push(nz>=0?[ia,ib,ic]:[ia,ic,ib]);
+  for(const ids0 of polygons){
+    const ids=ids0.filter((v,i,a)=>i===0||v!==a[i-1]);
+    if(ids.length<3) continue;
+    const pts=ids.map(i=>new THREE.Vector2(verts[i].p[0],verts[i].p[1]));
+    const cap=THREE.ShapeUtils.triangulateShape(pts,[]);
+    for(const tr of cap){
+      const ia=ids[tr[0]],ib=ids[tr[1]],ic=ids[tr[2]];
+      const A=verts[ia].p,B=verts[ib].p,C=verts[ic].p;
+      const nz=(B[0]-A[0])*(C[1]-A[1])-(B[1]-A[1])*(C[0]-A[0]);
+      added.push(nz>=0?[ia,ib,ic]:[ia,ic,ib]);
+    }
   }
-  return {tris:added,count:added.length,points:ids.length,maxEdge};
+  // Any crown chain left open is a hard error for this component: silently
+  // exporting an open ruin is worse than skipping the inconsistent cap.
+  const pairedIds=new Set(polygons.flat());
+  const crownIds=new Set(crownEdges.flatMap(e=>[e.a,e.b]));
+  let unclosed=0; for(const id of crownIds) if(!pairedIds.has(id)) unclosed++;
+  return {tris:added,count:added.length,edges:crownEdges.length,polygons:polygons.length,unclosed,maxJoin:polygons.maxJoin||0};
 }
 
 function triangleIndices(idx, ti){
@@ -2182,18 +2404,16 @@ async function loadBuildingTriangles(t) {
       if(!vis.length) continue;
       let tris=tris0.slice();
 
-      // Ruinen / offene Mauerkoerper: zuerst echte geschlossene Randkonturen
-      // deckeln. Danach auch offene, parallele Mauerkronen als lokale Streifen
-      // triangulieren; genau dieser Fall fehlt bei vielen swissBUILDINGS3D-Ruinen.
-      const topCaps=capClosedTopBoundaryLoops(tris,verts);
-      if(topCaps.count){
-        tris.push(...topCaps.tris);
-        debug(`Geschlossene Ruinen-/Maueroberseite: ${topCaps.count.toLocaleString('de-CH')} Dreiecke.`);
+      // v8.3.5: Konsequentes topologisches Schliessen jeder offenen
+      // Mauerkronenkante. Fundament- und Relief-Randkanten sind vorher explizit
+      // ausgeschlossen. Keine Delaunay-Heuristik mehr.
+      const crownCaps=capAllRuinCrowns(tris0,verts,t);
+      if(crownCaps.count){
+        tris.push(...crownCaps.tris);
+        debug(`Mauerkronen konsequent geschlossen: ${crownCaps.polygons} Polygon(e) · ${crownCaps.count.toLocaleString('de-CH')} Dreiecke · ${crownCaps.edges} offene Oberkanten · Koppelgrenze ${crownCaps.maxJoin.toFixed(2)} mm.`);
       }
-      const stripCaps=capOpenRuinTopStrips(tris0,verts);
-      if(stripCaps.count){
-        tris.push(...stripCaps.tris);
-        debug(`Offene Mauerkronen als Streifen geschlossen: ${stripCaps.count.toLocaleString('de-CH')} Dreiecke aus ${stripCaps.points} Randpunkten · Brueckengrenze ${stripCaps.maxEdge.toFixed(2)} mm.`);
+      if(crownCaps.unclosed){
+        debug(`WARNUNG: ${crownCaps.unclosed} Mauerkronen-Randpunkte konnten topologisch nicht gepaart werden.`);
       }
 
       // Fuer offene Ruinen die vertikale Lage nur robust am Sockel korrigieren.
@@ -2408,6 +2628,22 @@ async function generateTerrain() {
     let preFill = terrainStats(grid);
     if (els.smoothMissing.checked && preFill.missing > 0 && preFill.missing / preFill.total < 0.001) {
       filled = fillSmallGaps(grid, 20);
+    }
+
+    // Final 1-km seam consistency check. This runs only after all normal and
+    // fallback sources are loaded, so a temporary fallback cannot silently
+    // leave one rectangular tile a few decimetres above/below its neighbours.
+    setStatus('Kachelgrenzen auf Höhenversatz prüfen', 96);
+    const seamFix = harmonizeSwissAltiTileSeams(grid, d);
+    if (seamFix.corrected) {
+      debug(`Kachelnaht-Korrektur: ${seamFix.tiles} Kachel(n) starr angepasst · ${seamFix.constraints} belastbare Naht(en) · max. Korrektur ${seamFix.maxCorrection.toFixed(3)} m.`);
+      for (const e of seamFix.details.filter(e=>Math.abs(e.measured)>=0.08).slice(0,20)) {
+        debug(`  Naht ${e.a} ↔ ${e.b}: gemessener Offset ${e.measured>=0?'+':''}${e.measured.toFixed(3)} m · Streuung ${e.mad.toFixed(3)} m · n=${e.n}`);
+      }
+    } else if (seamFix.constraints) {
+      debug(`Kachelnaht-Prüfung: ${seamFix.constraints} mögliche Naht(en) geprüft; keine relevante Kachelverschiebung nötig.`);
+    } else {
+      debug('Kachelnaht-Prüfung: keine systematische 1-km-Höhenstufe erkannt.');
     }
     const stats = terrainStats(grid);
     const missingPct = stats.missing / stats.total * 100;

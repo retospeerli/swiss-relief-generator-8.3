@@ -1,3 +1,15 @@
+## v8.3.6
+
+- robustere Primär-Kachelladung vor Jahrgangs-/Auflösungs-Fallback
+- automatische Prüfung der 1-km-swissALTI³D-Kachelgrenzen auf systematische Höhenversätze
+- nur konsistente vertikale Kacheloffsets werden starr korrigiert; keine globale Glättung
+- geeignet auch für gedrehte Reliefausschnitte
+
+## v8.3.5
+
+- Mauerkronen werden topologisch statt per Delaunay-Heuristik geschlossen.
+- Fundament- und Modellrandkanten werden ausgeschlossen; alle übrigen offenen Oberkanten muessen zu geschlossenen Kronenpolygonen werden.
+
 ## v8.3.4
 
 - offene, parallele Mauerkronen von Ruinen werden nun als lokale Streifen trianguliert und geschlossen
