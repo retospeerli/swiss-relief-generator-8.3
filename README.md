@@ -1,3 +1,9 @@
+## v8.3.7
+
+- Priorität normale Gebäude: Gebäudegenerierung vollständig auf stabilen Stand v8.3.1 zurückgesetzt.
+- Sämtliche späteren Ruinen-Capping-/Kronen-Sonderalgorithmen entfernt.
+- Kachelnaht-/Höhenkorrekturen aus v8.3.6 bleiben erhalten.
+
 ## v8.3.6
 
 - robustere Primär-Kachelladung vor Jahrgangs-/Auflösungs-Fallback
