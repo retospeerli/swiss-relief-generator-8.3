@@ -1,3 +1,15 @@
+## v8.3.11
+
+- Gebäudedreiecke werden vor Vorschau/STL geometrisch dedupliziert.
+- Doppelte, deckungsgleiche swissBUILDINGS³D-Schalen werden nicht mehr mehrfach ausgegeben.
+- Keine neue Ruinen- oder Höhenlogik.
+
+## v8.3.10
+
+- kompletter swissBUILDINGS³D-Geometriepfad 1:1 aus v0.6.17 übernommen
+- Gebäude nur bei Drehung 0°; dadurch keine Änderungen am stabilen Gebäudecode nötig
+- Terrain-/Kachelstand bleibt aus v8.3.9
+
 ## v8.3.9
 
 - Gebäudegenerierung vollständig auf den stabilen v8.1-Stand zurückgesetzt.

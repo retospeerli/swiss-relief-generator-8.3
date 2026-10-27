@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3.9';
+const APP_VERSION = '8.3.11';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -466,6 +466,7 @@ function updateMetrics() {
 function buildingEligibility(d = null) {
   if (!rawSelection) return { ok:false, reason:'Zuerst ein Gebiet wählen.' };
   d = d || modelDimensions();
+  if (Math.abs(d.angleDeg || 0) > 1e-6) return { ok:false, reason:'Gebäude sind in v8.3.10 nur bei Nordausrichtung (0°) freigeschaltet, damit der stabile v0.6.17-Gebäudecode unverändert bleibt.' };
   const scale = d.groundW * 1000 / d.widthMm;
   const areaKm2 = d.groundW * d.groundH / 1e6;
   const typicalWidthMm = BUILDING_TYPICAL_WIDTH_M * d.mmPerMeter;
@@ -1257,9 +1258,8 @@ function terrainStats(grid) {
 function terrainElevationAtXY(t, x, y) {
   const { cols, rows, values } = t.grid;
   const d = t.dims;
-  const gf = worldToGridFraction(d, t.grid, x, y);
-  const cf = gf.cf;
-  const rf = gf.rf;
+  const cf = (x - d.minX) / d.groundW * (cols - 1);
+  const rf = (d.maxY - y) / d.groundH * (rows - 1);
   const c0 = Math.max(0, Math.min(cols - 1, Math.floor(cf)));
   const r0 = Math.max(0, Math.min(rows - 1, Math.floor(rf)));
   const c1 = Math.min(cols - 1, c0 + 1), r1 = Math.min(rows - 1, r0 + 1);
@@ -1583,12 +1583,19 @@ function buildCutPaths(segments, plane) {
 function borderTerrainPoint(t, plane, uMm) {
   const baseMm=Number(els.baseThickness.value);
   const zExag=Number(els.zExaggeration.value);
-  const px=plane.axis===0 ? plane.coord : uMm;
-  const py=plane.axis===0 ? uMm : plane.coord;
-  const lx=px/t.dims.mmPerMeter;
-  const ly=py/t.dims.mmPerMeter;
-  const wp=localGroundToWorld(t.dims,lx,ly);
-  const terr=terrainElevationAtXY(t,wp.x,wp.y);
+  let x,y,px,py;
+  if(plane.axis===0){
+    x=plane.coord<0 ? t.dims.minX : t.dims.maxX;
+    y=t.dims.minY + (uMm + t.dims.depthMm/2) / t.dims.mmPerMeter;
+    px=plane.coord; py=uMm;
+  } else {
+    y=plane.coord<0 ? t.dims.minY : t.dims.maxY;
+    x=t.dims.minX + (uMm + t.dims.widthMm/2) / t.dims.mmPerMeter;
+    px=uMm; py=plane.coord;
+  }
+  x=Math.max(t.dims.minX,Math.min(t.dims.maxX,x));
+  y=Math.max(t.dims.minY,Math.min(t.dims.maxY,y));
+  const terr=terrainElevationAtXY(t,x,y);
   const z=baseMm+(terr-t.stats.min)*t.dims.mmPerMeter*zExag;
   return {p:[px,py,z]};
 }
@@ -1796,41 +1803,20 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude: ${BUILDINGS_TILESET}`);
   debug(`Gebäude aktiviert · Massstab ca. 1:${Math.round(elig.scale).toLocaleString('de-CH')} · Fläche ${elig.areaKm2.toFixed(2)} km².`);
 
-  const centerX=t.dims.centerX, centerY=t.dims.centerY;
-  const centerLL=lonLatFromLv95(centerX,centerY);
-  const center={ lng:centerLL[0], lat:centerLL[1] };
-  const centerTerrain = terrainElevationAtXY(t, centerX, centerY);
-  // The building tiles are ECEF / ellipsoidal. LN02 terrain heights differ from
-  // ellipsoidal heights by roughly a few dozen metres in Switzerland. We do not
-  // yet know the exact local geoid offset (it is estimated after tiles load),
-  // so add a safe 60 m only for camera placement. The camera target must sit at
-  // the actual terrain level; v0.6.17 targeted h=0 and used a minimum camera
-  // height of 1200 m, which can put the camera below alpine terrain and yield
-  // exactly 0 tile loads.
-  const cameraTargetH = centerTerrain + 60;
-  const centerEcef = geodeticToEcef(center.lng, center.lat, cameraTargetH);
+  const b = selectedBounds;
+  const center = b.getCenter();
+  const centerEcef = geodeticToEcef(center.lng, center.lat, 0);
   const up = centerEcef.clone().normalize();
   const lon = center.lng * Math.PI/180, lat = center.lat * Math.PI/180;
   const north = new THREE.Vector3(-Math.sin(lat)*Math.cos(lon), -Math.sin(lat)*Math.sin(lon), Math.cos(lat)).normalize();
   const span = Math.max(t.dims.groundW, t.dims.groundH);
-  const baseClearance = Math.max(1200, span * 1.35);
-  const tileCam = new THREE.PerspectiveCamera(62, Math.max(.4, t.dims.groundW/t.dims.groundH), 10, Math.max(80000, (cameraTargetH + baseClearance) * 6));
-  const setTileCameraPose = (clearance, eastFrac=0, northFrac=0) => {
-    const east = new THREE.Vector3(-Math.sin(lon), Math.cos(lon), 0).normalize();
-    const target = centerEcef.clone()
-      .addScaledVector(east, span * eastFrac)
-      .addScaledVector(north, span * northFrac);
-    const localUp = target.clone().normalize();
-    tileCam.position.copy(target).addScaledVector(localUp, clearance);
-    tileCam.up.copy(north);
-    tileCam.lookAt(target);
-    tileCam.near = 10;
-    tileCam.far = Math.max(80000, clearance * 8 + span * 4);
-    tileCam.updateProjectionMatrix();
-    tileCam.updateMatrixWorld(true);
-  };
-  setTileCameraPose(baseClearance);
-  debug(`Gebäude-Kamera: Terrainzentrum ≈ ${centerTerrain.toFixed(1)} m ü. M. · Zielhöhe ≈ ${cameraTargetH.toFixed(1)} m · Grundabstand ${Math.round(baseClearance)} m.`);
+  const altitude = Math.max(1200, span * 1.25);
+  const tileCam = new THREE.PerspectiveCamera(58, Math.max(.4, t.dims.groundW/t.dims.groundH), 10, Math.max(50000, altitude*5));
+  tileCam.position.copy(centerEcef).addScaledVector(up, altitude);
+  tileCam.up.copy(north);
+  tileCam.lookAt(centerEcef);
+  tileCam.updateProjectionMatrix();
+  tileCam.updateMatrixWorld(true);
 
   const TilesRenderer = await getTilesRendererClass();
   const tiles = new TilesRenderer(BUILDINGS_TILESET);
@@ -1849,7 +1835,7 @@ async function loadBuildingTriangles(t) {
 
   tiles.setCamera(tileCam);
   tiles.setResolution(tileCam, 1600, 1600);
-  if ('errorTarget' in tiles) tiles.errorTarget = 3.0;
+  if ('errorTarget' in tiles) tiles.errorTarget = 2.5;
   if (tiles.lruCache) {
     if ('maxSize' in tiles.lruCache) tiles.lruCache.maxSize = Math.max(tiles.lruCache.maxSize || 0, 1200);
     if ('maxBytesSize' in tiles.lruCache) tiles.lruCache.maxBytesSize = Math.max(tiles.lruCache.maxBytesSize || 0, 700e6);
@@ -1870,58 +1856,14 @@ async function loadBuildingTriangles(t) {
   });
   const tmpScene = new THREE.Scene();
   tmpScene.add(tiles.group);
-
-  // Robust camera search. Most locations load on the first pass. If a location
-  // yields zero requests, retry from higher / slightly shifted viewpoints.
-  // This is intentionally only a tile-discovery change; all geometry handling
-  // below stays identical to v0.6.17.
-  const cameraAttempts = [
-    { clearance:baseClearance,     e:0,     n:0,     label:'zentral 1×' },
-    { clearance:baseClearance*2.0, e:0,     n:0,     label:'zentral 2×' },
-    { clearance:baseClearance*3.5, e:0,     n:0,     label:'zentral 3.5×' },
-    { clearance:baseClearance*2.2, e: 0.35, n:0,     label:'Ost versetzt' },
-    { clearance:baseClearance*2.2, e:-0.35, n:0,     label:'West versetzt' },
-    { clearance:baseClearance*2.2, e:0,     n: 0.35, label:'Nord versetzt' },
-    { clearance:baseClearance*2.2, e:0,     n:-0.35, label:'Süd versetzt' }
-  ];
-
-  for (let ai=0; ai<cameraAttempts.length; ai++) {
-    const a = cameraAttempts[ai];
-    const before = loadedEvents;
-    setTileCameraPose(a.clearance, a.e, a.n);
-    tiles.setResolution(tileCam, ai === 0 ? 1600 : 1200, ai === 0 ? 1600 : 1200);
-    if ('errorTarget' in tiles) tiles.errorTarget = ai === 0 ? 3.0 : 5.0;
-    tiles.resetFailedTiles?.();
-    stable = 0; lastEvents = loadedEvents;
-    for (let i=0; i<90; i++) {
-      tileCam.updateMatrixWorld(true);
-      tiles.group.updateMatrixWorld(true);
-      tiles.update();
-      await sleep(80);
-      if (loadedEvents === lastEvents) stable++; else stable=0;
-      lastEvents=loadedEvents;
-      if (i > 18 && stable > 12) break;
-    }
-    const gained = loadedEvents - before;
-    debug(`Gebäude-Suche ${ai+1}/${cameraAttempts.length} · ${a.label} · Abstand ${Math.round(a.clearance)} m → ${gained} neue Tile-Ladevorgänge (gesamt ${loadedEvents}).`);
-    if (loadedEvents > 0) {
-      // Once the hierarchy is active, return to the accurate central view and
-      // allow a longer refinement pass so the requested small area gets detail.
-      setTileCameraPose(baseClearance);
-      tiles.setResolution(tileCam, 1800, 1800);
-      if ('errorTarget' in tiles) tiles.errorTarget = 2.5;
-      stable = 0; lastEvents = loadedEvents;
-      for (let i=0; i<120; i++) {
-        tileCam.updateMatrixWorld(true);
-        tiles.group.updateMatrixWorld(true);
-        tiles.update();
-        await sleep(70);
-        if (loadedEvents === lastEvents) stable++; else stable=0;
-        lastEvents=loadedEvents;
-        if (i > 25 && stable > 16) break;
-      }
-      break;
-    }
+  for (let i=0; i<180; i++) {
+    tileCam.updateMatrixWorld(true);
+    tiles.group.updateMatrixWorld(true);
+    tiles.update();
+    await sleep(80);
+    if (loadedEvents === lastEvents) stable++; else stable=0;
+    lastEvents=loadedEvents;
+    if (i > 25 && stable > 18) break;
   }
   tiles.group.updateMatrixWorld(true);
 
@@ -1957,8 +1899,7 @@ async function loadBuildingTriangles(t) {
       wp.fromBufferAttribute(pos,i).applyMatrix4(mesh.matrixWorld);
       const [lo,la,h]=ecefToGeodetic(wp.x,wp.y,wp.z);
       const [x,y]=lv95FromLonLat(lo,la);
-      const loc=worldToLocalGround(t.dims,x,y);
-      if(Math.abs(loc.lx)>t.dims.groundW/2 || Math.abs(loc.ly)>t.dims.groundH/2) continue;
+      if(x<t.dims.minX||x>t.dims.maxX||y<t.dims.minY||y>t.dims.maxY) continue;
       diffs.push(h-terrainElevationAtXY(t,x,y));
       if(diffs.length>80000) break;
     }
@@ -1992,9 +1933,8 @@ async function loadBuildingTriangles(t) {
     const [x,y]=lv95FromLonLat(lo,la);
     const terr=terrainElevationAtXY(t,x,y);
     const correctedH=h-geoidOffset;
-    const loc=worldToLocalGround(t.dims,x,y);
-    const xm=loc.lx*t.dims.mmPerMeter;
-    const ym=loc.ly*t.dims.mmPerMeter;
+    const xm=(x-t.dims.minX)*t.dims.mmPerMeter-t.dims.widthMm/2;
+    const ym=(y-t.dims.minY)*t.dims.mmPerMeter-t.dims.depthMm/2;
     const terrainZ=baseMm+(terr-t.stats.min)*t.dims.mmPerMeter*zExag;
     // Gebäudehöhe selbst bleibt massstäblich 1:1. Die Relief-Überhöhung wird
     // später als EIN konstanter Z-Versatz pro zusammenhängendem Gebäudekörper
@@ -2162,8 +2102,31 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude-Fundamentband: ${foundationBandMm.toFixed(2)} mm über lokalem Terrain.`);
   tiles.dispose?.();
   if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
-  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke im Primärschnitt; Randhäuser exakt gekappt/geschlossen: ${borderHardCropped.toLocaleString('de-CH')}; Randhäuser verworfen statt überstehend ausgegeben: ${borderHardCropFailed.toLocaleString('de-CH')}; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
-  return { triangles:new Float32Array(out), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset } };
+  // v8.3.11: swissBUILDINGS³D can expose the same geometric shell through
+  // overlapping/duplicated tile scene meshes. Never export coincident duplicate
+  // triangles: they create non-manifold buildings although the visible geometry
+  // looks correct. Deduplicate by geometry, independent of winding order.
+  const dedup=[];
+  const seenTriangles=new Set();
+  const qv=(v)=>Math.round(v*100000); // 0.00001 mm: effectively exact for STL output
+  for(let i=0;i<out.length;i+=9){
+    const pts=[
+      `${qv(out[i])},${qv(out[i+1])},${qv(out[i+2])}`,
+      `${qv(out[i+3])},${qv(out[i+4])},${qv(out[i+5])}`,
+      `${qv(out[i+6])},${qv(out[i+7])},${qv(out[i+8])}`
+    ].sort();
+    const key=pts.join('|');
+    if(seenTriangles.has(key)) continue;
+    seenTriangles.add(key);
+    dedup.push(out[i],out[i+1],out[i+2],out[i+3],out[i+4],out[i+5],out[i+6],out[i+7],out[i+8]);
+  }
+  const rawTriCount=Math.floor(out.length/9);
+  const dedupTriCount=Math.floor(dedup.length/9);
+  const duplicateTriangles=rawTriCount-dedupTriCount;
+  if(duplicateTriangles>0) debug(`Gebäude-Duplikate entfernt: ${duplicateTriangles.toLocaleString('de-CH')} exakt deckungsgleiche Dreiecke verworfen (${rawTriCount.toLocaleString('de-CH')} → ${dedupTriCount.toLocaleString('de-CH')}).`);
+  triCount=dedupTriCount;
+  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} eindeutige Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke im Primärschnitt; Randhäuser exakt gekappt/geschlossen: ${borderHardCropped.toLocaleString('de-CH')}; Randhäuser verworfen statt überstehend ausgegeben: ${borderHardCropFailed.toLocaleString('de-CH')}; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
+  return { triangles:new Float32Array(dedup), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset, duplicateTrianglesRemoved:duplicateTriangles } };
 }
 
 async function generateTerrain() {
