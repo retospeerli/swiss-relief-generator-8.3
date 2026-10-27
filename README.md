@@ -1,3 +1,9 @@
+## v8.3.9
+
+- Gebäudegenerierung vollständig auf den stabilen v8.1-Stand zurückgesetzt.
+- Entfernt: Gebäude-Verbundlogik, Schwebe-Erkennung, automatische Objektabsenkung und Ruinen-Sonderbehandlung.
+- Terrain-/Kachelwahl aus v8.3.8 bleibt erhalten.
+
 ## v8.3.8
 
 - entfernt die fehlerhafte starre 1-km-Kachel-Z-Korrektur aus v8.3.6/v8.3.7

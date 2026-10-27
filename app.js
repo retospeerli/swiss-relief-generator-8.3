@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3.8';
+const APP_VERSION = '8.3.9';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -1974,7 +1974,7 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude-Höhenabgleich: lokaler Offset ≈ ${geoidOffset.toFixed(2)} m · Gebäudehöhe 1.00× (keine Relief-Überhöhung).`);
 
   const out=[];
-  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0, borderFallbackFull=0, borderHardCropped=0, borderHardCropFailed=0, floatingComponentsCorrected=0, floatingCorrectionMaxM=0;
+  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0, borderFallbackFull=0, borderHardCropped=0, borderHardCropFailed=0;
   const va=new THREE.Vector3(), vb=new THREE.Vector3(), vc=new THREE.Vector3();
   const modelClipPlanes = makeModelClipPlanes(t);
   const baseMm=Number(els.baseThickness.value);
@@ -2059,119 +2059,15 @@ async function loadBuildingTriangles(t) {
       compTerr.get(r).push(verts[vi].terr);
     }
 
-    // v8.2.1: Dach, Fassaden und Gebäudekörper dürfen NIEMALS separat
-    // gegeneinander verschoben werden. swissBUILDINGS³D kann ein einziges Haus
-    // als mehrere topologisch getrennte Komponenten liefern (z. B. Dach und
-    // Gebäudekörper). Deshalb werden Komponenten mit stark überlappendem
-    // Grundriss zunächst zu einem starren Gebäudeverbund gruppiert. Eine
-    // Schwebe-Korrektur wird anschliessend genau einmal auf die gesamte Gruppe
-    // angewendet.
-    const componentRoots=[...compTris.keys()];
-    const compBox=new Map();
-    for(const r of componentRoots){
-      const vis=compVerts.get(r)||[];
-      let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
-      for(const vi of vis){
-        const p=verts[vi].p;
-        minX=Math.min(minX,p[0]); maxX=Math.max(maxX,p[0]);
-        minY=Math.min(minY,p[1]); maxY=Math.max(maxY,p[1]);
-      }
-      compBox.set(r,{minX,maxX,minY,maxY,area:Math.max(0,maxX-minX)*Math.max(0,maxY-minY)});
-    }
-    const gParent=new Map(componentRoots.map(r=>[r,r]));
-    const gFind=(r)=>{ let p=gParent.get(r); while(p!==gParent.get(p)){ gParent.set(p,gParent.get(gParent.get(p))); p=gParent.get(p); } return p; };
-    const gUnite=(a,b)=>{ a=gFind(a); b=gFind(b); if(a!==b) gParent.set(b,a); };
-    for(let i=0;i<componentRoots.length;i++){
-      const a=componentRoots[i], A=compBox.get(a);
-      for(let j=i+1;j<componentRoots.length;j++){
-        const b=componentRoots[j], B=compBox.get(b);
-        const ix=Math.max(0,Math.min(A.maxX,B.maxX)-Math.max(A.minX,B.minX));
-        const iy=Math.max(0,Math.min(A.maxY,B.maxY)-Math.max(A.minY,B.minY));
-        const inter=ix*iy;
-        const smaller=Math.max(1e-9,Math.min(A.area,B.area));
-        // Dächer überdecken den Gebäudekörper normalerweise nahezu vollständig.
-        // 20 % Überdeckung des kleineren BBox reicht, um harte Kanten-/Dach-
-        // Komponenten desselben Hauses zusammenzuhalten, ohne weit entfernte
-        // Gebäude zu koppeln.
-        if(inter/smaller>=0.20) gUnite(a,b);
-      }
-    }
-    const groups=new Map();
-    for(const r of componentRoots){
-      const gr=gFind(r);
-      if(!groups.has(gr)) groups.set(gr,[]);
-      groups.get(gr).push(r);
-    }
-
-    const shiftedRoots=new Set();
-    const groupForRoot=new Map();
-    for(const [gr,roots] of groups){ for(const r of roots) groupForRoot.set(r,gr); }
-
-    // v8.2.2: Die Relief-Überhöhung wird ebenfalls EINMAL pro starrem
-    // Gebäudeverbund angewendet. Sonst könnten Dach und Fassaden trotz gemeinsamer
-    // Schwebe-Korrektur durch unterschiedliche Terrain-Referenzen wieder gegeneinander
-    // verrutschen.
-    for(const [gr,roots] of groups){
-      const groupVis=[];
-      const groupTerr=[];
-      for(const r of roots){
-        groupVis.push(...(compVerts.get(r)||[]));
-        groupTerr.push(...(compTerr.get(r)||[]));
-      }
-      if(groupVis.length<3) continue;
-      const sortedTerr=groupTerr.filter(Number.isFinite).sort((a,b)=>a-b);
-      const refTerr=sortedTerr.length ? percentile(sortedTerr,0.15) : t.stats.min;
-      const exaggerationShift=(refTerr-t.stats.min)*t.dims.mmPerMeter*(zExag-1);
-      for(const vi of new Set(groupVis)) verts[vi].p[2]+=exaggerationShift;
-
-      // Nur die untere Hülle des gesamten Verbunds betrachten: pro XY-Position
-      // zählt der tiefste Vertex. Damit können Dach-, Giebel- oder Mauerkronenpunkte
-      // die vertikale Platzierung nicht bestimmen.
-      const xyStepMm=Math.max(0.08, Math.min(0.35, 0.18 + t.dims.mmPerMeter*0.25));
-      const lowerByXY=new Map();
-      for(const vi of groupVis){
-        const v=verts[vi];
-        if(!Number.isFinite(v.p[2])||!Number.isFinite(v.terrainZ)) continue;
-        const k=`${Math.round(v.p[0]/xyStepMm)},${Math.round(v.p[1]/xyStepMm)}`;
-        const old=lowerByXY.get(k);
-        if(old==null || v.p[2]<verts[old].p[2]) lowerByXY.set(k,vi);
-      }
-      const lower=[...lowerByXY.values()].map(vi=>({vi,gapMm:verts[vi].p[2]-verts[vi].terrainZ})).filter(o=>Number.isFinite(o.gapMm));
-      if(lower.length<3) continue;
-      const gapsMm=lower.map(o=>o.gapMm).sort((a,b)=>a-b);
-      const baseGapMm=percentile(gapsMm,0.10);
-      const clusterTolM=Math.max(0.75, Math.min(2.0, BUILDING_TYPICAL_HEIGHT_M*0.12));
-      const clusterTolMm=clusterTolM*t.dims.mmPerMeter;
-      const foundation=lower.filter(o=>o.gapMm<=baseGapMm+clusterTolMm);
-      if(foundation.length<2) continue;
-      const maxFoundationGapMm=Math.max(...foundation.map(o=>o.gapMm));
-      const baseGapM=baseGapMm/Math.max(1e-9,t.dims.mmPerMeter);
-      const maxFoundationGapM=maxFoundationGapMm/Math.max(1e-9,t.dims.mmPerMeter);
-      const FLOAT_GAP_THRESHOLD_M=0.85;
-      const MAX_OBJECT_SHIFT_M=20.0;
-
-      // Starr nur so weit absenken, dass der höchste Punkt der erkannten
-      // Fundament-Unterkante im FERTIG überhöhten Modell mindestens embedMm
-      // unter dem lokalen Terrain liegt. Damit ist die Unterkante vollständig
-      // versenkt, ohne den restlichen Baukörper unnötig tief zu setzen.
-      if(baseGapM>FLOAT_GAP_THRESHOLD_M){
-        const objectShiftMm=Math.min(MAX_OBJECT_SHIFT_M*t.dims.mmPerMeter, Math.max(0,maxFoundationGapMm+embedMm));
-        if(objectShiftMm<=0) continue;
-        const objectShiftM=objectShiftMm/Math.max(1e-9,t.dims.mmPerMeter);
-        for(const vi of new Set(groupVis)){
-          verts[vi].p[2]-=objectShiftMm;
-          verts[vi].correctedH-=objectShiftM;
-        }
-        for(const r of roots) shiftedRoots.add(r);
-        floatingComponentsCorrected++;
-        floatingCorrectionMaxM=Math.max(floatingCorrectionMaxM,objectShiftM);
-        debug(`Gebäudeverbund schwebend erkannt: Fundament-Unterkante ${foundation.length}/${lower.length} Punkte · Basisabstand ≈ ${baseGapM.toFixed(2)} m · max. Fundamentabstand ${maxFoundationGapM.toFixed(2)} m · starr ${objectShiftM.toFixed(2)} m abgesenkt · Unterkante ≥ ${embedMm.toFixed(2)} mm im Boden.`);
-      }
-    }
-
     for(const [r,tris] of compTris){
       const vis=compVerts.get(r)||[];
       if(!vis.length) continue;
+      const arr=(compTerr.get(r)||[]).slice().sort((a,b)=>a-b);
+      const qi=Math.min(arr.length-1,Math.max(0,Math.floor(arr.length*0.15)));
+      const refTerr=arr[qi];
+      const exaggerationShift=(refTerr-t.stats.min)*t.dims.mmPerMeter*(zExag-1);
+      for(const vi of vis) verts[vi].p[2]+=exaggerationShift;
+
       // Nur echte Sockelpunkte dieses Gebäudes bis leicht ins Terrain ziehen.
       const foundationIdx=new Set();
       for(const [ia,ib,ic] of tris){
@@ -2186,14 +2082,9 @@ async function loadBuildingTriangles(t) {
           if(above>=-0.25 && above<=foundationBandMm) foundationIdx.add(vi);
         }
       }
-      // Bereits als ganzer Verbund abgesenkte Sonderobjekte bleiben strikt starr.
-      // Ihre erkannte Unterkante wurde oben vollständig unter das lokale Terrain
-      // gesetzt; hier dürfen keine Einzelvertices mehr nachgezogen werden.
-      if(!shiftedRoots.has(r)){
-        for(const vi of foundationIdx){
-          const v=verts[vi], target=v.terrainZ-embedMm;
-          if(v.p[2]>target){v.p[2]=target;foundationVertices++;}
-        }
+      for(const vi of foundationIdx){
+        const v=verts[vi], target=v.terrainZ-embedMm;
+        if(v.p[2]>target){v.p[2]=target;foundationVertices++;}
       }
 
       // Klassifikation ausschliesslich in den fertigen Modellkoordinaten (mm).
@@ -2269,11 +2160,10 @@ async function loadBuildingTriangles(t) {
     }
   }
   debug(`Gebäude-Fundamentband: ${foundationBandMm.toFixed(2)} mm über lokalem Terrain.`);
-  if (floatingComponentsCorrected) debug(`Schwebende Gebäudeobjekte korrigiert: ${floatingComponentsCorrected.toLocaleString('de-CH')} · grösste Absenkung ${floatingCorrectionMaxM.toFixed(2)} m.`);
   tiles.dispose?.();
   if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
   debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke im Primärschnitt; Randhäuser exakt gekappt/geschlossen: ${borderHardCropped.toLocaleString('de-CH')}; Randhäuser verworfen statt überstehend ausgegeben: ${borderHardCropFailed.toLocaleString('de-CH')}; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
-  return { triangles:new Float32Array(out), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset, floatingComponentsCorrected, floatingCorrectionMaxM } };
+  return { triangles:new Float32Array(out), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset } };
 }
 
 async function generateTerrain() {
