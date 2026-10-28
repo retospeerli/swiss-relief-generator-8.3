@@ -1,3 +1,8 @@
+## v8.3.12
+
+- Gebäude-Topologie: Verschweisstoleranz auf 0.01 mm erhöht, damit Dach-, Fassaden- und Bodenteile zuverlässig zu geschlossenen Körpern verbunden werden.
+- Keine Änderung an Gebäudehöhen, Terrain oder Ruinenlogik.
+
 ## v8.3.11
 
 - Gebäudedreiecke werden vor Vorschau/STL geometrisch dedupliziert.

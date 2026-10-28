@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3.11';
+const APP_VERSION = '8.3.12';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -1970,11 +1970,13 @@ async function loadBuildingTriangles(t) {
     // sie geometrisch exakt dieselben Eckpunkte besitzen. Für das saubere
     // Schneiden eines Randhauses müssen wir deshalb IMMER geometrisch
     // identische Punkte verschweissen, nicht nur bei nicht-indexierten Meshes.
-    // 1e-4 mm im fertigen Modell ist deutlich kleiner als jede Druckrelevanz,
-    // aber gross genug, um numerisches Transformationsrauschen aufzufangen.
+    // v8.3.12: Dach-, Fassaden- und Bodenteile aus swissBUILDINGS3D liegen
+    // teilweise nur wenige Tausendstel Millimeter auseinander. 0.01 mm im
+    // fertigen Modell ist drucktechnisch unsichtbar, verbindet aber diese
+    // nominell identischen Gebäudekanten zuverlässig zu einer Topologie.
     const weld=new Map();
     let weldedVertices=0;
-    const WELD_SCALE=10000; // 0.0001 mm
+    const WELD_SCALE=100; // 0.01 mm
     for(let vi=0;vi<verts.length;vi++){
       const v=verts[vi];
       const k=`${Math.round(v.p[0]*WELD_SCALE)}:${Math.round(v.p[1]*WELD_SCALE)}:${Math.round(v.p[2]*WELD_SCALE)}`;
